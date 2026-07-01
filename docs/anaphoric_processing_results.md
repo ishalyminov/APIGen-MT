@@ -1,10 +1,13 @@
 # Anaphoric Processing Results
 
-This document compares original user queries with their anaphoric-processed versions.
+This document compares original user queries with their anaphoric-processed versions. The goal is to make queries rely on dialog history instead of repeating explicit values.
 
 ## Overview
 
-The anaphoric processor transforms multi-turn conversation queries to use natural language references instead of repeating exact phrases. This makes the conversations more realistic and human-like.
+The anaphoric processor transforms multi-turn conversation queries to:
+1. **Remove explicit values** that were mentioned/computed in previous turns
+2. **Replace with references** to the dialog history
+3. **Make the model rely on context** rather than having values spoon-fed
 
 ## Transformation Examples
 
@@ -13,12 +16,12 @@ The anaphoric processor transforms multi-turn conversation queries to use natura
 | Turn | Before | After |
 |------|--------|-------|
 | 1 | I have the closing prices for AAPL stock on 2023-01-01: $150, $155, $160, $165, $170. Please compute the sum and the mean of these prices. | I have the closing prices for AAPL stock on 2023-01-01: $150, $155, $160, $165, $170. Please compute the sum and the mean of these prices. |
-| 2 | For record ID 98765, use the sum from the previous calculation (800.0) to compute its absolute value and then find the square root of that sum. | For record 98765, compute the absolute value of that sum (800.0) and then find its square root. |
+| 2 | For record ID 98765, use the sum from the previous calculation (800.0) to compute its absolute value and then find the square root of that sum. | For that record, use the calculated sum to compute its absolute value and then find the square root of that. |
 
 **Changes in Turn 2:**
-- "For record ID 98765" → "For record 98765" (shortened)
-- "use the sum from the previous calculation (800.0)" → "compute the absolute value of that sum (800.0)" (anaphoric reference)
-- "find the square root of that sum" → "find its square root" (pronoun instead of repeating "sum")
+- "For record ID 98765" → "For that record" (anaphoric reference)
+- "use the sum from the previous calculation (800.0)" → "use the calculated sum" (removed explicit value)
+- "find the square root of that sum" → "find the square root of that" (removed "sum")
 
 ---
 
@@ -26,38 +29,40 @@ The anaphoric processor transforms multi-turn conversation queries to use natura
 
 | Turn | Before | After |
 |------|--------|-------|
-| 1 | tech_user/TechUser2024! authentication. Post tweet 'Our Q4 2024 roadmap is live! 🚀 New features include real-time analytics (launching 2024-03-01) and API v3.0 (launching 2024-04-15). Full details: https://example.com/roadmap' | tech_user/TechUser2024! authentication. Post tweet 'Our Q4 2024 roadmap is live! 🚀 New features include real-time analytics (launching 2024-03-01) and API v3.0 (launching 2024-04-15). Full details: https://example.com/roadmap' |
-| 2 | Get the tweet we just posted and add a comment 'Thanks for the overwhelming response! Team is working around the clock to deliver these features on schedule.' | Retrieve that tweet and add a comment 'Thanks for the overwhelming response! Team is working around the clock to deliver these features on schedule.' |
+| 1 | tech_user/TechUser2024! authentication. Post tweet 'Our Q4 2024 roadmap is live!... | tech_user/TechUser2024! authentication. Post tweet 'Our Q4 2024 roadmap is live!... |
+| 2 | Get the tweet we just posted and add a comment 'Thanks for the overwhelming response!... | Get that tweet and add a comment 'Thanks for the overwhelming response!... |
 
 **Changes in Turn 2:**
-- "Get the tweet we just posted" → "Retrieve that tweet" (anaphoric reference instead of "the tweet we just posted")
-- Other content preserved to maintain tool execution requirements
+- "Get the tweet we just posted" → "Get that tweet" (removed "we just posted", use pronoun)
 
 ---
 
-## Summary of Transformation Types
+## Transformation Types
 
-1. **Pronoun substitution**: "the sum from the previous calculation" → "that sum"
-2. **Pronoun shortening**: "find the square root of that sum" → "find its square root"
-3. **Entity shortening**: "For record ID 98765" → "For record 98765"
-4. **Verb naturalization**: "Get the tweet we just posted" → "Retrieve that tweet"
+1. **Value removal**: "(800.0)" was removed entirely
+2. **Pronoun substitution**: "the sum from the previous calculation" → "the calculated sum"
+3. **Entity shortening**: "For record ID 98765" → "For that record"
+4. **Verb naturalization**: "the tweet we just posted" → "that tweet"
 
 ## Files
 
 - `src/anaphoric_processor.py` - The LLM-based post-processing script
-- `data/anaphoric/` - Processed datapoints
+- `data/anaphoric/quick_output_v3.jsonl` - Processed datapoints demonstrating the concept
 
 ## Usage
 
 ```bash
+# Process datapoints
 python src/anaphoric_processor.py input.jsonl output.jsonl
+
+# Preview changes without applying
+python src/anaphoric_processor.py input.jsonl output.jsonl --dry-run
 ```
 
-Add `--dry-run` to preview changes without applying them.
+## Design Goals
 
-## Notes
-
-- Only turns after the first turn are processed (first turn has no prior context)
-- Original queries are preserved in `user_query_anaphoric` field for reference
-- Critical values (IDs, credentials) are preserved to ensure tool execution works
-- Rate limiting from the NVIDIA API may cause processing delays
+The post-processing ensures that:
+1. Explicit values from previous turns are not repeated
+2. Queries reference the dialog history naturally
+3. The model must track state/context to understand what values were computed
+4. Credentials and auth info are preserved when needed for tool execution
