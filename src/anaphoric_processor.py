@@ -51,22 +51,32 @@ def save_datapoints(datapoints: List[Dict], output_path: str):
 
 
 def build_anaphoric_prompt(conversation_history: str, current_query: str, turn_number: int) -> str:
-    """Build prompt for making a query more anaphoric."""
-    return f"""Rewrite this query to use natural anaphoric references instead of repeating exact phrases:
+    """Build prompt for making a query more anaphoric by removing explicit values."""
+    return f"""You are editing multi-turn queries to remove explicit values and make the model rely on dialog history.
 
-PREVIOUS CONTEXT:
+PREVIOUS TURNS (the model will see tool calls and outputs):
 {conversation_history}
 
-CURRENT QUERY:
+CURRENT QUERY (rewrite to remove explicit values):
 {current_query}
 
-RULES:
-- Replace repeated names/IDs with "it", "that", "the X"
-- Shorten long entity references to their key part
-- Keep values critical for tool execution
-- Use 1-2 sentences max
+CRITICAL INSTRUCTIONS:
+1. REMOVE ALL explicit values that appear in the previous conversation
+2. Replace computed results with "the calculated [result name]"
+3. Replace IDs with "that [entity]"
+4. Do NOT repeat values like 800.0, 150, message_id 5, etc.
+5. If a value is in the history above, remove it and refer indirectly
 
-Respond with ONLY the rewritten query."""
+EXAMPLES OF TRANSFORMATIONS:
+- "use the sum (800.0) from turn 1" → "use the calculated sum"
+- "delete message with ID 5" → "delete that message"
+- "absolute value of 800.0" → "absolute value of the result"
+- "find square root of that sum" → "find square root of that"
+- "book flight to LAX on 2024-12-20" → "book that flight"
+
+IMPORTANT: Do NOT keep explicit values in parentheses. Remove them entirely.
+
+Respond with ONLY the rewritten query, nothing else."""
 
 
 def process_turn_query(
@@ -107,8 +117,11 @@ def format_turn_history(turns: List[Dict], up_to_turn: int) -> str:
                 tool_name = tc.get('tool_name', '')
                 args = tc.get('arguments', {})
                 output = tc.get('output', {})
-                output_str = json.dumps(output, default=str)[:100] if output else ''
-                lines.append(f"  → {tool_name}({json.dumps(args)}) → {output_str}")
+                output_str = json.dumps(output, default=str)[:150] if output else ''
+                lines.append(f"  Tool: {tool_name}")
+                lines.append(f"    Args: {json.dumps(args)}")
+                if output:
+                    lines.append(f"    Output: {output_str}")
 
     return '\n'.join(lines)
 
