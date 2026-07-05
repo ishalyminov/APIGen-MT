@@ -10,7 +10,7 @@ import time
 import requests
 from pathlib import Path
 from llm_client import LLMClient, LocalOpenAILLMClient
-from tool_manager import ToolManager, filter_api_state
+from tool_manager import ToolManager, filter_api_state, ToolInputError
 from prompts import StepByStepPrompts
 from config_pool import generate_query_seed
 
@@ -1228,7 +1228,7 @@ When generating arguments that need a person's name, use {p['name']}.
 When generating arguments that need a city or location, prefer {c['city']}.
 """
 
-        # Build API state section — prefer the class relevant to this tool
+# Build API state section — prefer the class relevant to this tool
         api_state_section = ""
         if current_api_state:
             class_key = self.tool_manager.api_name_to_class_key.get(tool_name)
@@ -1236,12 +1236,18 @@ When generating arguments that need a city or location, prefer {c['city']}.
                 state_for_tool = {class_key: current_api_state[class_key]}
             else:
                 state_for_tool = current_api_state
+            # For cd, exclude current_dir to prevent LLM from using absolute paths
+            if tool_name == 'cd' and 'gorilla_file_system' in state_for_tool:
+                state_for_tool = dict(state_for_tool)
+                state_for_tool['gorilla_file_system'] = dict(state_for_tool['gorilla_file_system'])
+                state_for_tool['gorilla_file_system'].pop('current_dir', None)
+                state_for_tool['gorilla_file_system']['note'] = 'cd uses folder names relative to current directory'
             api_state_section = f"""
 === CURRENT API STATE ===
 The following is the REAL current state of the API. You MUST use values from this state when providing arguments (e.g., user IDs, ticket IDs, usernames, access tokens). Do NOT invent or guess values — use the ones shown below.
 
 {json.dumps(state_for_tool, indent=2, default=str)[:4000]}
-            """
+"""
 
         prompt = f"""Generate arguments for '{tool_name}' based on user query and previous steps.
 
@@ -1269,7 +1275,17 @@ Generate args matching schema and fulfilling query:
 - For LOGIN: use stored credentials from API state
 - card_id: 'card_XXXX' (from register_credit_card), access_token: from prior authenticate_travel, booking_id: 'flight_XXX'
 
-Respond JSON: {"arg1": "value1", ...}}"""
+=== CRITICAL: ARGUMENT RULES ===
+- dir_name, file_name, folder: MUST be simple names, NOT paths
+  - WRONG: "src/main.py", "my_project/src", "folder/file.txt"
+  - RIGHT: "src", "main.py", "config.ini"
+- For Storage tools: only use simple names without "/" or "\\"
+- cd folder must be relative to current directory (e.g., "src" not "/tmp/vfs_xxx/src")
+- touch/mkdir create ONE file/directory only - do NOT use space-separated names like "file1 file2"
+
+Respond with ONLY a single JSON object: {"param1": "value1", "param2": "value2"}
+Do NOT generate multiple JSON objects. Do NOT generate a list. Generate ONLY one JSON object with all required parameters.
+"""
 
         try:
             response = self._safe_llm_generate([{"role": "user", "content": prompt}])
@@ -1344,11 +1360,24 @@ Respond JSON: {"arg1": "value1", ...}}"""
 
                 # Simulate tool execution
                 print(f" Simulating {tool_name}...")
-                output = self._simulate_tool_execution(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    execution_context=execution_context
-                )
+                try:
+                    output = self._simulate_tool_execution(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        execution_context=execution_context
+                    )
+                except ToolInputError as e:
+                    print(f" ✗ Input validation failed for {tool_name}: {e.errors}")
+                    if attempt < max_retries_per_tool - 1:
+                        tool_feedback = (
+                            f"INVALID INPUT SCHEMA for {tool_name}. "
+                            f"Validation errors: {e.errors}. "
+                            f"Expected parameters for {tool_name}: {list(self.tool_manager._tool_input_schemas.get(tool_name, {}).model_fields.keys()) if hasattr(self.tool_manager, '_tool_input_schemas') else 'unknown'}. "
+                            f"Generate CORRECT arguments matching the schema."
+                        )
+                        print(f" Retrying due to input validation failure...")
+                        continue
+                    output = {"error": f"Input validation failed after {max_retries_per_tool} attempts: {e.errors}"}
 
                 print(f" Output: {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
 

@@ -101,8 +101,12 @@ class GorillaFileSystem:
             return {"error": f"Source '{source}' not found"}
         
         dst_path = self._get_relative_path(destination)
+        
+        if dst_path.is_dir():
+            dst_path = dst_path / src_path.name
+        
         if dst_path.exists():
-            return {"error": f"Destination '{destination}' already exists"}
+            return {"error": f"Destination '{dst_path.name}' already exists"}
         
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -111,7 +115,7 @@ class GorillaFileSystem:
                 shutil.copytree(src_path, dst_path)
             else:
                 shutil.copy2(src_path, dst_path)
-            return {"success": True, "message": f"Copied '{source}' to '{destination}'"}
+            return {"success": True, "message": f"Copied '{source}' to '{dst_path}'"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -214,12 +218,16 @@ class GorillaFileSystem:
             return {"error": f"Source '{source}' not found"}
         
         dst_path = self._get_relative_path(destination)
+        
+        if dst_path.is_dir():
+            dst_path = dst_path / src_path.name
+        
         if dst_path.exists():
-            return {"error": f"Destination '{destination}' already exists"}
+            return {"error": f"Destination '{dst_path.name}' already exists"}
         
         try:
             shutil.move(str(src_path), str(dst_path))
-            return {"success": True, "message": f"Moved '{source}' to '{destination}'", "source": source, "destination": destination}
+            return {"success": True, "message": f"Moved '{source}' to '{dst_path}'", "source": source, "destination": str(dst_path)}
         except Exception as e:
             return {"error": str(e)}
 

@@ -287,11 +287,26 @@ class MultiTurnGenerator(StepByStepGenerator):
 
 === CRITICAL: PATH HANDLING ===
 - file_name/dir_name must be simple names, NOT paths (e.g., "config.ini" not "folder/config.ini")
+- NEVER use paths like "src/main.py" or "my_project/src" - these are INVALID
 - To work in a subdirectory: first use cd to navigate there, THEN use file operations
 - Example CORRECT sequence:
   1. mkdir project
-  2. cd project  
-  3. touch file.txt (NOT "project/file.txt")
+  2. cd project
+  3. touch file.txt
+- Example WRONG: mkdir project/src (paths in dir_name are NOT allowed)
+
+=== CRITICAL: OPERATION ORDERING ===
+- BEFORE copying TO a directory: first CREATE the directory with mkdir
+- BEFORE cd'ing into a directory: first CREATE it with mkdir
+- BEFORE using a file_name that shouldn't exist: CREATE it first with touch
+- Example CORRECT: mkdir backup && cp settings.ini backup && cd backup
+- Example WRONG: cp settings.ini backup (creates "backup" as a FILE, then cd backup fails)
+
+=== CRITICAL: COPY OPERATION ===
+- cp copies ONE file to ONE destination
+- To copy multiple files: use multiple cp calls (e.g., cp file1 backup && cp file2 backup)
+- Do NOT do "cp file1 file2 file3 dest" - this is invalid
+- The source argument is always a single file, destination is a directory or new filename
 
 === REQUIREMENTS ===
 1. Each turn: specific entities (IDs, names, dates, prices) + EXACTLY {self.num_actions} tools
@@ -311,7 +326,13 @@ class MultiTurnGenerator(StepByStepGenerator):
 {{"overall_task": "scenario", "turns": [{{"user_query": "request", "expected_tools": ["t1", "t2"]}}, ...]}}"""
 
         if focus_category:
-            prompt += f"\n\nIMPORTANT: Use ONLY tools from '{focus_category}' category. Do NOT use tools from other categories."
+            prompt += f"\n\nIMPORTANT: Use ONLY tools from '{focus_category}' category."
+            if focus_category == 'Storage':
+                prompt += """ STORAGE TOOLS: You MUST use only these EXACT tool names:
+- mkdir, cd, touch, ls, cat, echo, cp, mv, rm, rmdir
+- grep, wc, find, du, tail, sort
+Do NOT use 'head' - it does not exist. Only 'tail' exists for viewing file ends.
+"""
         else:
             prompt += "\n\nYou may use tools from any category."
 
@@ -354,6 +375,11 @@ class MultiTurnGenerator(StepByStepGenerator):
                     # Validate category if focus_category is specified
                     if focus_category:
                         for tool_name in expected:
+                            # First check if tool exists at all
+                            if not self.tool_manager.tool_exists(tool_name):
+                                validation_errors.append(f"Turn {i+1} tool '{tool_name}' does NOT exist. Use only valid tool names from the provided list.")
+                                all_tools_valid = False
+                                break
                             tool_cat = self.tool_manager.get_tool_category(tool_name)
                             if tool_cat != focus_category:
                                 validation_errors.append(f"Turn {i+1} tool '{tool_name}' is from category '{tool_cat}', not '{focus_category}'. Use only {focus_category} tools.")
