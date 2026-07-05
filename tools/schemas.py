@@ -70,69 +70,69 @@ class WcInput(BaseModel):
 # ─── MathAPI ──────────
 
 class AbsoluteValueInput(BaseModel):
-    number: str = Field(description="The number to calculate the absolute value of. ")
+    number: float = Field(description="The number to calculate the absolute value of. ")
 
 class AddInput(BaseModel):
-    a: str = Field(description="First number.")
-    b: str = Field(description="Second number. ")
+    a: float = Field(description="First number.")
+    b: float = Field(description="Second number. ")
 
 class DivideInput(BaseModel):
-    a: str = Field(description="Numerator.")
-    b: str = Field(description="Denominator. ")
+    a: float = Field(description="Numerator.")
+    b: float = Field(description="Denominator. ")
 
 class ImperialSiConversionInput(BaseModel):
     unit_in: str = Field(description="Unit of the input value.")
     unit_out: str = Field(description="Unit to convert the value to. ")
-    value: str = Field(description="Value to be converted.")
+    value: float = Field(description="Value to be converted.")
 
 class LogarithmInput(BaseModel):
-    base: str = Field(description="The base of the logarithm.")
+    base: float = Field(description="The base of the logarithm.")
     precision: int = Field(description="Desired precision for the result. ")
-    value: str = Field(description="The number to compute the logarithm of.")
+    value: float = Field(description="The number to compute the logarithm of.")
 
 class MaxValueInput(BaseModel):
-    numbers: List = Field(description="List of numbers to find the maximum from. ")
+    numbers: List[float] = Field(description="List of numbers to find the maximum from. ")
 
 class MeanInput(BaseModel):
-    numbers: List = Field(description="List of numbers to calculate the mean of. ")
+    numbers: List[float] = Field(description="List of numbers to calculate the mean of. ")
 
 class MinValueInput(BaseModel):
-    numbers: List = Field(description="List of numbers to find the minimum from. ")
+    numbers: List[float] = Field(description="List of numbers to find the minimum from. ")
 
 class MultiplyInput(BaseModel):
-    a: str = Field(description="First number.")
-    b: str = Field(description="Second number. ")
+    a: float = Field(description="First number.")
+    b: float = Field(description="Second number. ")
 
 class PercentageInput(BaseModel):
-    part: str = Field(description="The part value.")
-    whole: str = Field(description="The whole value. ")
+    part: float = Field(description="The part value.")
+    whole: float = Field(description="The whole value. ")
 
 class PowerInput(BaseModel):
-    base: str = Field(description="The base number.")
-    exponent: str = Field(description="The exponent. ")
+    base: float = Field(description="The base number.")
+    exponent: float = Field(description="The exponent. ")
 
 class RoundNumberInput(BaseModel):
     decimal_places: Optional[int] = Field(default=None, description="The number of decimal places to round to. Defaults to 0. ")
-    number: str = Field(description="The number to round.")
+    number: float = Field(description="The number to round.")
 
 class SiUnitConversionInput(BaseModel):
     unit_in: str = Field(description="Unit of the input value.")
     unit_out: str = Field(description="Unit to convert the value to. ")
-    value: str = Field(description="Value to be converted.")
+    value: float = Field(description="Value to be converted.")
 
 class SquareRootInput(BaseModel):
-    number: str = Field(description="The number to calculate the square root of.")
+    number: float = Field(description="The number to calculate the square root of.")
     precision: int = Field(description="Desired precision for the result. ")
 
 class StandardDeviationInput(BaseModel):
-    numbers: List = Field(description="List of numbers to calculate the standard deviation of. ")
+    numbers: List[float] = Field(description="List of numbers to calculate the standard deviation of. ")
 
 class SubtractInput(BaseModel):
-    a: str = Field(description="Number to subtract from.")
-    b: str = Field(description="Number to subtract. ")
+    a: float = Field(description="Number to subtract from.")
+    b: float = Field(description="Number to subtract. ")
 
 class SumValuesInput(BaseModel):
-    numbers: List = Field(description="List of numbers to sum. ")
+    numbers: List[float] = Field(description="List of numbers to sum. ")
 
 # ─── MessageAPI ──────────
 
