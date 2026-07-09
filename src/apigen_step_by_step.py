@@ -15,6 +15,57 @@ from prompts import StepByStepPrompts
 from config_pool import generate_query_seed
 
 
+# ==================== PSEUDO-TOOLS (think, refuse) ====================
+
+THINK_TOOL_SCHEMA = {
+    "name": "think",
+    "description": "Reason about the next action before calling a tool. Always call this before deciding which tool(s) to use.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reasoning": {
+                "type": "string",
+                "description": "Your step-by-step reasoning about what to do next and why."
+            }
+        },
+        "required": ["reasoning"]
+    },
+    "output_type": "string",
+    "output_description": "The reasoning text.",
+    "category": "Meta"
+}
+
+REFUSE_TOOL_SCHEMA = {
+    "name": "refuse",
+    "description": "Refuse the user request when it cannot be fulfilled. Use this when there is no appropriate tool, required arguments are missing, or the request is ambiguous.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "reason": {
+                "type": "string",
+                "enum": ["no_appropriate_function", "missing_argument", "ambiguity"],
+                "description": "The type of refusal reason."
+            },
+            "explanation": {
+                "type": "string",
+                "description": "A human-readable explanation of why the request is refused."
+            }
+        },
+        "required": ["reason", "explanation"]
+    },
+    "output_type": "dict",
+    "output_description": "A dictionary with the refusal reason and explanation.",
+    "category": "Meta"
+}
+
+PSEUDO_TOOLS = {
+    "think": THINK_TOOL_SCHEMA,
+    "refuse": REFUSE_TOOL_SCHEMA,
+}
+
+REFUSAL_TYPES = ["no_appropriate_function", "missing_argument", "ambiguity"]
+
+
 class ToolCallWithOutput(BaseModel):
     """A single tool call with its simulated output."""
     tool_name: str
@@ -54,6 +105,7 @@ class TokenUsageStats(BaseModel):
     """Token usage statistics for a single datapoint."""
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    reasoning_tokens: int = 0
     total_tokens: int = 0
     total_llm_calls: int = 0
 
@@ -92,17 +144,25 @@ class QueryGenerationResult(BaseModel):
     query: str
     intent: str
     expected_tools: List[str] = []
+    action_plan: List[List[str]] = []  # each inner list = parallel tools for one step
+    should_refuse: bool = False
+    refusal_type: Optional[str] = None  # "no_appropriate_function" | "missing_argument" | "ambiguity"
 
 
 class StepByStepGenerator:
     """Generator that creates datapoints step-by-step with immediate tool simulation."""
 
-    def __init__(self, llm_client: LLMClient, tool_manager: ToolManager, num_actions: int = 2, validate_outputs: bool = True, judge_client: LLMClient = None):
+    def __init__(self, llm_client: LLMClient, tool_manager: ToolManager, num_actions: int = 2, validate_outputs: bool = True, judge_client: LLMClient = None,
+                 enable_think: bool = True, allow_refusal: bool = True, refusal_rate: float = 0.12, parallel_prob: float = 0.25):
         self.llm = llm_client
         self.judge = judge_client or llm_client
         self.tool_manager = tool_manager
         self.num_actions = num_actions
         self.validate_outputs = validate_outputs
+        self.enable_think = enable_think
+        self.allow_refusal = allow_refusal
+        self.refusal_rate = refusal_rate
+        self.parallel_prob = parallel_prob
         self._python_tools_available = bool(tool_manager.python_tool_instances)
         self._accumulated_prompt_tokens: int = 0
         self._accumulated_completion_tokens: int = 0
@@ -147,6 +207,7 @@ class StepByStepGenerator:
         """Reset token tracking for a new datapoint."""
         self._accumulated_prompt_tokens = 0
         self._accumulated_completion_tokens = 0
+        self._accumulated_reasoning_tokens = 0
         self._accumulated_total_tokens = 0
         self._accumulated_llm_calls = 0
         self._initial_token_usage = None
@@ -163,6 +224,7 @@ class StepByStepGenerator:
         current_usage = self.llm.get_token_usage()
         self._accumulated_prompt_tokens = current_usage["prompt_tokens"] - self._initial_token_usage["prompt_tokens"]
         self._accumulated_completion_tokens = current_usage["completion_tokens"] - self._initial_token_usage["completion_tokens"]
+        self._accumulated_reasoning_tokens = current_usage.get("reasoning_tokens", 0) - self._initial_token_usage.get("reasoning_tokens", 0)
         self._accumulated_total_tokens = current_usage["total_tokens"] - self._initial_token_usage["total_tokens"]
         self._accumulated_llm_calls = current_usage["total_calls"] - self._initial_token_usage["total_calls"]
     
@@ -171,6 +233,7 @@ class StepByStepGenerator:
         return TokenUsageStats(
             prompt_tokens=self._accumulated_prompt_tokens,
             completion_tokens=self._accumulated_completion_tokens,
+            reasoning_tokens=self._accumulated_reasoning_tokens,
             total_tokens=self._accumulated_total_tokens,
             total_llm_calls=self._accumulated_llm_calls
         )
@@ -182,12 +245,15 @@ class StepByStepGenerator:
         return json.dumps(schemas, indent=2, ensure_ascii=False)
 
 
-    def _get_tools_with_descriptions_str(self, category: Optional[str] = None, compact: bool = False) -> str:
+    def _get_tools_with_descriptions_str(self, category: Optional[str] = None, compact: bool = False, include_pseudo: bool = False) -> str:
         """Get a formatted string of tools with their full descriptions, organized by category."""
         tools = self.tool_manager.get_tools_json_schema()
 
         if category:
             tools = [t for t in tools if t.get('category') == category]
+
+        if include_pseudo:
+            tools = list(tools) + [THINK_TOOL_SCHEMA, REFUSE_TOOL_SCHEMA]
 
         if compact:
             result = []
@@ -211,6 +277,33 @@ class StepByStepGenerator:
                 name = tool['name']
                 desc = tool.get('description', 'No description available.')
                 result.append(f" - {name}: {desc}")
+
+        return "\n".join(result)
+
+    def _get_tools_with_params_str(self, category: Optional[str] = None) -> str:
+        """Get tools with descriptions AND required/optional parameter annotations.
+
+        Format: tool_name: description [REQUIRED: param1, param2] [OPTIONAL: param3]
+        """
+        tools = self.tool_manager.get_tools_json_schema()
+
+        if category:
+            tools = [t for t in tools if t.get('category') == category]
+
+        result = []
+        for tool in tools:
+            name = tool['name']
+            desc = tool.get('description', '')[:100]
+            params = tool.get('parameters', {})
+            required = params.get('required', [])
+            optional = params.get('optional', [])
+
+            parts = [f"{name}: {desc}"]
+            if required:
+                parts.append(f"[REQUIRED: {', '.join(required)}]")
+            if optional:
+                parts.append(f"[OPTIONAL: {', '.join(optional)}]")
+            result.append(" ".join(parts))
 
         return "\n".join(result)
 
@@ -365,8 +458,9 @@ Respond with JSON:
         return "\n".join(result)
 
     def generate_user_query(self, focus_category: Optional[str] = None, validation_feedback: Optional[str] = None, max_retries: int = 3, query_seed: Optional[dict] = None) -> QueryGenerationResult:
-        # Get tools with full descriptions
         tools_with_descriptions = self._get_tools_with_descriptions_str(category=focus_category, compact=True)
+        tools_with_params = self._get_tools_with_params_str(category=focus_category)
+        self._refusal_focus_category = focus_category  # store for later use in _stage2
 
         accumulated_feedback = validation_feedback or ""
         example_queries = self._get_example_queries()
@@ -384,7 +478,36 @@ If the query involves a credit card, use the name {p['name']} as cardholder.
 Do NOT use "Michael Smith", "John", or generic American names — use {p['name']} exclusively.
 """
 
+        # Decide whether this should be a refusal query
+        is_refusal_query = self.allow_refusal and random.random() < self.refusal_rate
+
         for attempt in range(max_retries):
+            if is_refusal_query:
+                refusal_type = random.choice(REFUSAL_TYPES)
+                query_result = self._generate_refusal_query(
+                    focus_category=focus_category,
+                    refusal_type=refusal_type,
+                    tools_with_descriptions=tools_with_descriptions,
+                    tools_with_params=tools_with_params,
+                    persona_section=persona_section,
+                    example_queries=example_queries,
+                    accumulated_feedback=accumulated_feedback,
+                    attempt=attempt,
+                )
+                if query_result:
+                    is_genuine, reject_reason = self._check_refusal_is_genuine(
+                        query=query_result.query,
+                        refusal_type=query_result.refusal_type,
+                        focus_category=focus_category,
+                    )
+                    if is_genuine:
+                        return query_result
+                    print(f" ✗ Refusal validation failed: {reject_reason}")
+                    accumulated_feedback += f"\n--- REFUSAL ATTEMPT {attempt + 1} REJECTED ---\nQuery: {query_result.query}\nReason: {reject_reason}\n--- END ATTEMPT {attempt + 1} ---"
+                    continue
+                accumulated_feedback += f"\n--- REFUSAL ATTEMPT {attempt + 1} FAILED ---\n--- END ATTEMPT {attempt + 1} ---"
+                continue
+
             prompt = f"""Generate a realistic user query requiring EXACTLY {self.num_actions} tools.
 
 === REQUIREMENTS ===
@@ -393,6 +516,10 @@ Do NOT use "Michael Smith", "John", or generic American names — use {p['name']
 3. expected_tools: EXACTLY {self.num_actions} tool names from AVAILABLE TOOLS
 4. CRITICAL: Use ONLY tools from AVAILABLE TOOLS - no invented names
 5. Auth tools need login FIRST (e.g., place_order needs trading_login)
+6. Some steps may have PARALLEL tools (independent actions done simultaneously)
+   - action_plan format: list of steps, each step is a list of tool names
+   - Example: [["authenticate_twitter"], ["post_tweet", "follow_user"], ["get_tweet"]]
+   - Only batch tools that have NO data dependency on each other
 {persona_section}
 === AVAILABLE TOOLS ===
 {tools_with_descriptions}
@@ -404,7 +531,9 @@ Do NOT use "Michael Smith", "John", or generic American names — use {p['name']
             prompt += f"""
 === TASK ===
 Generate query requiring EXACTLY {self.num_actions} tools. Respond JSON:
-{{"query": "specific with names/IDs", "intent": "what user wants", "expected_tools": ["tool1", ...]}}"""
+{{"query": "specific with names/IDs", "intent": "what user wants", "expected_tools": ["tool1", ...], "action_plan": [["tool1"], ["tool2", "tool3"], ...]}}
+
+The action_plan must list tools in execution order. Steps with multiple tools mean those tools run in parallel. The total number of tools across all steps must equal {self.num_actions}."""
 
             try:
                 response = self._safe_llm_generate([{"role": "user", "content": prompt}])
@@ -424,15 +553,18 @@ Generate query requiring EXACTLY {self.num_actions} tools. Respond JSON:
                 query = result.get("query", "")
                 intent = result.get("intent", "")
                 expected_tools = result.get("expected_tools", [])
+                action_plan = result.get("action_plan", [])
 
                 print(f" Generated Query: {query}")
                 print(f" Intent: {intent}")
                 print(f" Expected tools: {expected_tools}")
+                print(f" Action plan: {action_plan}")
 
                 generated_summary = f"""--- ATTEMPT {attempt + 1} OUTPUT ---
 Query: {query}
 Intent: {intent}
-Expected tools: {expected_tools}"""
+Expected tools: {expected_tools}
+Action plan: {action_plan}"""
 
                 if len(expected_tools) != self.num_actions:
                     print(f" ✗ Wrong tool count: {len(expected_tools)} != {self.num_actions}")
@@ -464,6 +596,16 @@ Available tools (sample): {available_tools[:15]}
 --- END ATTEMPT {attempt + 1} ---"""
                     continue
 
+                # Validate and fix action_plan
+                if not action_plan:
+                    action_plan = [[t] for t in expected_tools]
+                    print(f" No action_plan provided, using sequential: {action_plan}")
+                else:
+                    flat_plan = [t for step in action_plan for t in step]
+                    if sorted(flat_plan) != sorted(expected_tools):
+                        print(f" ⚠ action_plan mismatch, falling back to sequential")
+                        action_plan = [[t] for t in expected_tools]
+
                 if self.num_actions <= 5:
                     is_valid, validation_msg = self.validate_expected_tools(query, expected_tools, intent)
 
@@ -473,7 +615,10 @@ Available tools (sample): {available_tools[:15]}
                         continue
 
                 print(f" ✓ Query generation successful")
-                return QueryGenerationResult(query=query, intent=intent, expected_tools=expected_tools)
+                return QueryGenerationResult(
+                    query=query, intent=intent, expected_tools=expected_tools,
+                    action_plan=action_plan, should_refuse=False
+                )
 
             except json.JSONDecodeError as e:
                 print(f" ✗ JSON decode error: {e}")
@@ -482,6 +627,132 @@ Available tools (sample): {available_tools[:15]}
 
         print(f" Failed to generate valid query after {max_retries} attempts")
         return QueryGenerationResult(query="", intent="", expected_tools=[])
+
+    def _check_refusal_is_genuine(self, query: str, refusal_type: str,
+                                   focus_category: Optional[str]) -> Tuple[bool, str]:
+        """Validate that a refusal query is genuinely unanswerable given the available tools."""
+        tools_str = self._get_tools_with_params_str(category=focus_category)
+
+        prompt = f"""Determine whether this user query can actually be fulfilled using the available tools.
+
+=== AVAILABLE TOOLS (with required parameters) ===
+{tools_str}
+
+=== USER QUERY ===
+{query}
+
+=== CLAIMED REFUSAL TYPE ===
+{refusal_type}
+
+=== TASK ===
+Analyze each part of the user's request against the available tools and their REQUIRED parameters.
+A query is ANSWERABLE if:
+1. A tool exists that can perform the requested action, AND
+2. All REQUIRED parameters are either explicitly stated in the query or can be reasonably inferred from context.
+
+Pay special attention to tools with few required parameters — e.g., if a tool only requires "title", then "create a ticket about X" IS answerable (title can be derived from X).
+
+Respond JSON: {{"is_answerable": true/false, "reasoning": "which tools could fulfill it and what params are present/missing"}}"""
+
+        try:
+            response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+            response_text = response.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    response_text = response_text[start:end]
+
+            result = json.loads(response_text)
+            is_answerable = result.get("is_answerable", False)
+            reasoning = result.get("reasoning", "")
+
+            if is_answerable:
+                return False, f"Query is actually answerable: {reasoning}"
+            return True, ""
+        except Exception as e:
+            return True, ""  # On validation error, accept the refusal
+
+    def _generate_refusal_query(self, focus_category: Optional[str], refusal_type: str,
+                                 tools_with_descriptions: str, persona_section: str,
+                                 example_queries: str, accumulated_feedback: str, attempt: int,
+                                 tools_with_params: str = "") -> Optional[QueryGenerationResult]:
+        """Generate a query that should be refused by the assistant."""
+
+        refusal_descriptions = {
+            "no_appropriate_function": "The user asks for something that NONE of the available tools can do. For example, asking to send an email when only Twitter posting tools are available, or asking to translate text when no translation tool exists. CRITICAL: Verify that no tool's core action matches the request. Do NOT claim a tool is unavailable if it is listed above — if a tool exists, the request is answerable (possibly via missing_argument instead).",
+            "missing_argument": "The user asks for something that CAN be done with available tools, but a REQUIRED parameter is genuinely missing and cannot be inferred from the query. For example: 'post a tweet' without specifying content, 'send a message' without specifying recipient or message text, 'book a flight' without specifying destination. CRITICAL: Check the [REQUIRED] params of each tool — if the only required params can be derived from the query (e.g., a tool that only needs 'title' and the query says 'create a ticket about X'), then this is NOT a missing_argument case.",
+            "ambiguity": "The user's request is vague or ambiguous and cannot be acted upon without clarification. For example: 'fix it', 'do the thing', 'contact them', or requests where it's unclear which entity or action is meant.",
+        }
+
+        refusal_desc = refusal_descriptions.get(refusal_type, refusal_descriptions["ambiguity"])
+
+        tools_section = tools_with_params if tools_with_params else tools_with_descriptions
+
+        prompt = f"""Generate a realistic user query that CANNOT be fulfilled by the available tools.
+
+=== REFUSAL TYPE: {refusal_type} ===
+{refusal_desc}
+
+=== REQUIREMENTS ===
+1. The query should seem realistic — a real user might ask this
+2. The query should be UNANSWERABLE with the available tools
+3. The assistant should need to REFUSE this request
+4. CRITICAL: Before generating, verify that NO available tool (with its REQUIRED params satisfiable) can fulfill the request. Check the [REQUIRED] params — if they can be inferred from the query, the request IS answerable.
+{persona_section}
+=== AVAILABLE TOOLS (with parameter requirements) ===
+{tools_section}
+{example_queries}"""
+        if focus_category:
+            prompt += f"\n=== FOCUS CATEGORY ===\nPrimary: {focus_category}\n"
+        if accumulated_feedback:
+            prompt += f"\n=== FEEDBACK ===\n{accumulated_feedback}\n"
+        prompt += f"""
+=== TASK ===
+Generate an unanswerable user query of type "{refusal_type}". Respond JSON:
+{{"query": "the unanswerable request", "intent": "what the user is trying to do", "expected_tools": ["refuse"], "refusal_type": "{refusal_type}"}}"""
+
+        try:
+            response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+            response_text = response.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    response_text = response_text[start:end]
+
+            result = json.loads(response_text)
+            query = result.get("query", "")
+            intent = result.get("intent", "")
+
+            if not query:
+                print(f" ✗ Empty refusal query")
+                return None
+
+            print(f" Generated Refusal Query ({refusal_type}): {query}")
+            print(f" Intent: {intent}")
+
+            return QueryGenerationResult(
+                query=query, intent=intent,
+                expected_tools=["refuse"],
+                action_plan=[["refuse"]],
+                should_refuse=True,
+                refusal_type=refusal_type,
+            )
+
+        except json.JSONDecodeError as e:
+            print(f" ✗ JSON decode error in refusal query: {e}")
+            return None
 
     def _generate_next_step(self, query: str, trajectory: List[TrajectoryStep], execution_context: Dict[str, Any], expected_tools: List[str], step_num: int = 1) -> StepSelectionResult:
         trajectory_str = ""
@@ -678,8 +949,8 @@ Respond ONLY with valid JSON:
         print(f" Expected tools: {query_result.expected_tools}")
         print(f" Tokens so far: {self._accumulated_total_tokens:,}")
 
-        # Stage 1.5: Adjust initial API state for expected tools
-        if self._python_tools_available and query_result.expected_tools:
+        # Stage 1.5: Adjust initial API state for expected tools (skip refusal queries)
+        if self._python_tools_available and query_result.expected_tools and not query_result.should_refuse:
             print("\n" + "-" * 70)
             print("STAGE 1.5: Adjust Initial API State")
             print("-" * 70)
@@ -762,6 +1033,11 @@ Respond ONLY with valid JSON:
     Intent: {query_result.intent}
     Expected tools: {query_result.expected_tools}"""
 
+            # Refusal queries skip normal validation
+            if query_result.should_refuse:
+                print(f"  ✓ Refusal query ({query_result.refusal_type}) - skipping tool validation")
+                return query_result
+
             # Verify expected_tools
             print(f"  Verifying expected tools...")
 
@@ -775,8 +1051,8 @@ Respond ONLY with valid JSON:
                 accumulated_feedback += f"\n{generated_summary}\nFAILURE: expected_tools count mismatch - got {len(query_result.expected_tools)}, need {self.num_actions}.\n--- END ATTEMPT {attempt + 1} ---"
                 continue
 
-            # Check if all tools exist
-            invalid_tools = [t for t in query_result.expected_tools if not self.tool_manager.tool_exists(t)]
+            # Check if all tools exist (skip "refuse" which is a pseudo-tool)
+            invalid_tools = [t for t in query_result.expected_tools if t != "refuse" and not self.tool_manager.tool_exists(t)]
             if invalid_tools:
                 print(f"  ✗ ERROR: Tools not found: {invalid_tools}")
                 accumulated_feedback += f"\n{generated_summary}\nFAILURE: Tools not found: {invalid_tools}.\n--- END ATTEMPT {attempt + 1} ---"
@@ -1294,164 +1570,467 @@ Respond JSON: {"arg1": "value1", ...}}"""
         except json.JSONDecodeError as e:
             return None, f"JSON parsing error: {e}"
 
+    def _generate_think_step(self, query: str, trajectory: List[TrajectoryStep],
+                              execution_context: Dict[str, Any], upcoming_tools: List[str],
+                              current_api_state: Optional[Dict[str, Dict[str, Any]]] = None) -> TrajectoryStep:
+        """Generate a think step with LLM reasoning before a tool call."""
+        trajectory_str = ""
+        for i, step in enumerate(trajectory):
+            for tc in step.tool_calls:
+                trajectory_str += f"\nStep {i+1}: {tc.tool_name}"
+                if tc.output:
+                    trajectory_str += f" -> {str(tc.output)[:100]}"
+
+        tools_desc = ", ".join(upcoming_tools) if len(upcoming_tools) > 1 else upcoming_tools[0]
+        parallel_note = " (these tools will run in parallel)" if len(upcoming_tools) > 1 else ""
+
+        prompt = f"""You are an AI assistant. Based on the conversation so far, explain your reasoning for the next action.
+
+=== USER QUERY ===
+{query}
+
+=== ACTIONS SO FAR ===
+{trajectory_str if trajectory_str else "None"}
+
+=== NEXT ACTION ===
+{tools_desc}{parallel_note}
+
+=== TASK ===
+Explain your reasoning for why this is the correct next step. Consider:
+- What has been accomplished so far
+- Why this tool is needed now
+- What you expect the result to be
+
+Respond JSON: {{"reasoning": "your step-by-step reasoning"}}"""
+
+        try:
+            response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+            response_text = response.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    response_text = response_text[start:end]
+
+            result = json.loads(response_text)
+            reasoning_text = result.get("reasoning", "")
+        except Exception as e:
+            print(f"  ⚠ Think step failed: {e}")
+            reasoning_text = f"Preparing to call {tools_desc}."
+
+        think_call = ToolCallWithOutput(
+            tool_name="think",
+            arguments={"reasoning": reasoning_text},
+            output=reasoning_text,
+        )
+        return TrajectoryStep(
+            step_number=0,  # will be renumbered
+            tool_calls=[think_call],
+            reasoning=reasoning_text,
+        )
+
+    def _generate_refuse_arguments(self, query: str, refusal_type: str,
+                                    trajectory: List[TrajectoryStep],
+                                    tools_with_descriptions: str = "") -> Tuple[Dict[str, Any], Optional[str]]:
+        """Generate arguments for the refuse tool."""
+        trajectory_str = ""
+        for i, step in enumerate(trajectory):
+            for tc in step.tool_calls:
+                trajectory_str += f"\nStep {i+1}: {tc.tool_name}"
+
+        prompt = f"""Generate a refusal response for the user query.
+
+=== AVAILABLE TOOLS ===
+{tools_with_descriptions if tools_with_descriptions else "(not available)"}
+
+=== USER QUERY ===
+{query}
+
+=== REFUSAL TYPE ===
+{refusal_type}
+
+Refusal type meanings:
+- no_appropriate_function: No available tool can fulfill this request
+- missing_argument: Critical information is missing from the request
+- ambiguity: The request is vague and cannot be acted upon without clarification
+
+=== ACTIONS SO FAR ===
+{trajectory_str if trajectory_str else "None"}
+
+=== TASK ===
+Generate a refusal with the appropriate reason and a helpful explanation.
+
+IMPORTANT: Reference the ACTUAL available tools above. If a tool EXISTS that partially addresses the request, acknowledge it in the explanation (e.g., "I can use trading_login, but I don't have your credentials"). Do NOT falsely claim a tool is unavailable when it is listed above.
+
+Respond JSON: {{"reason": "{refusal_type}", "explanation": "specific explanation of what's wrong and what's needed"}}"""
+
+        try:
+            response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+            response_text = response.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    response_text = response_text[start:end]
+
+            arguments = json.loads(response_text)
+            if not isinstance(arguments, dict):
+                return {"reason": refusal_type, "explanation": "Unable to fulfill request."}, None
+            return arguments, None
+        except Exception as e:
+            return {"reason": refusal_type, "explanation": f"Unable to fulfill request ({refusal_type})."}, None
+
+    def _generate_parallel_arguments(self, tool_names: List[str], query: str, trajectory: List[TrajectoryStep],
+                                      execution_context: Dict[str, Any],
+                                      current_api_state: Optional[Dict[str, Dict[str, Any]]] = None,
+                                      query_seed: Optional[dict] = None) -> Tuple[Optional[Dict[str, Dict[str, Any]]], Optional[str]]:
+        """Generate arguments for multiple parallel tools in one LLM call."""
+        tool_schemas = []
+        for tn in tool_names:
+            schema = self.tool_manager.get_tool_schema(tn)
+            if schema:
+                tool_schemas.append(schema)
+        if not tool_schemas:
+            return None, "No valid tool schemas found"
+
+        trajectory_str = ""
+        for i, step in enumerate(trajectory):
+            for tc in step.tool_calls:
+                trajectory_str += f"\nStep {i+1}: {tc.tool_name}"
+                if tc.output:
+                    trajectory_str += f" -> {str(tc.output)[:100]}"
+
+        persona_section = ""
+        if query_seed:
+            p = query_seed["persona"]
+            persona_section = f"\nUser name: {p['name']}, City: {p['city']}"
+
+        api_state_section = ""
+        if current_api_state:
+            relevant_keys = set()
+            for tn in tool_names:
+                ck = self.tool_manager.api_name_to_class_key.get(tn)
+                if ck:
+                    relevant_keys.add(ck)
+            state_for_tools = {k: v for k, v in current_api_state.items() if k in relevant_keys}
+            api_state_section = f"\n=== CURRENT API STATE ===\n{json.dumps(state_for_tools, indent=2, default=str)[:4000]}"
+
+        prompt = f"""Generate arguments for MULTIPLE tools to be called in parallel.
+
+=== USER QUERY ===
+{query}
+
+=== PREVIOUS STEPS ===
+{trajectory_str if trajectory_str else "None"}
+{persona_section}
+=== EXECUTION CONTEXT ===
+{json.dumps(execution_context, indent=2, default=str)[:2000]}
+{api_state_section}
+=== TOOL SCHEMAS (call ALL of these in parallel) ===
+{json.dumps([{k: s.get(k) for k in ['name', 'parameters']} for s in tool_schemas], indent=2)}
+
+=== TASK ===
+Generate arguments for each tool. These tools are INDEPENDENT and run simultaneously.
+Respond JSON: {{"tool_name_1": {{"arg": "value"}}, "tool_name_2": {{"arg": "value"}}}}"""
+
+        try:
+            response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+            response_text = response.strip()
+
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0]
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0]
+            else:
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                if start >= 0 and end > start:
+                    response_text = response_text[start:end]
+
+            result = json.loads(response_text)
+            if not isinstance(result, dict):
+                return None, f"Expected dict, got {type(result).__name__}"
+            return result, None
+        except json.JSONDecodeError as e:
+            return None, f"JSON parsing error: {e}"
+
     def _stage2_generate_tools(self, query_result: QueryGenerationResult,
                                max_retries_per_tool: int, query_seed: Optional[dict] = None,
                                initial_execution_context: Optional[Dict[str, Any]] = None) -> Optional[Tuple[List[TrajectoryStep], Dict[str, Any]]]:
         """
-        Stage 2: Generate tool invocations tool-by-tool.
-        Uses expected_tools from Stage 1 directly - no LLM selection needed.
-        - Each tool has its own retry count for argument generation
-        - Feedback is wiped on successful tool completion
-        - Captures pre/post API state snapshots around each tool call
-        - Runs LLM-as-judge state verification after each call
-        - If any tool fails after max retries, entire stage fails
-        - Returns (trajectory, execution_context) or None
+        Stage 2: Generate tool invocations with think, parallel, and refuse support.
+        Uses action_plan from Stage 1 — each step may have 1+ parallel tools.
+        Generates a think step before each action step.
+        Returns (trajectory, execution_context) or None.
         """
         trajectory: List[TrajectoryStep] = []
         execution_context: Dict[str, Any] = initial_execution_context.copy() if initial_execution_context else {}
+        step_counter = 0
 
-        for step_num, tool_name in enumerate(query_result.expected_tools, 1):
-            print(f"\n[Step {step_num}/{self.num_actions}] Processing tool: {tool_name}")
+        # ── Handle refusal queries ──
+        if query_result.should_refuse:
+            step_counter += 1
+            print(f"\n[Step {step_counter}] REFUSAL query ({query_result.refusal_type})")
 
-            tool_feedback = ""
-            step_success = False
-
-            for attempt in range(max_retries_per_tool):
-                print(f" [Attempt {attempt + 1}/{max_retries_per_tool}]")
-
-                # ── Capture PRE state snapshot ──
-                pre_state = self.tool_manager.get_api_state() if self._python_tools_available else None
-
-                # Generate arguments for this tool (with feedback from previous failures)
-                print(f"  Generating arguments for {tool_name}...")
-                arguments, error = self._generate_tool_arguments(
-            tool_name=tool_name,
-            query=query_result.query,
-            trajectory=trajectory,
-            execution_context=execution_context,
-            feedback=tool_feedback if tool_feedback else None,
-            current_api_state=pre_state,
-            query_seed=query_seed,
-        )
-
-                if error:
-                    print(f" ✗ {error}")
-                    if attempt < max_retries_per_tool - 1:
-                        continue
-                    break
-
-                print(f" Arguments: {json.dumps(arguments)}")
-
-                # Simulate tool execution
-                print(f" Simulating {tool_name}...")
-                output = self._simulate_tool_execution(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    execution_context=execution_context
+            # Generate think step
+            if self.enable_think:
+                step_counter += 1
+                print(f" [Think {step_counter}]")
+                think_step = self._generate_think_step(
+                    query=query_result.query, trajectory=trajectory,
+                    execution_context=execution_context,
+                    upcoming_tools=["refuse"],
+                    current_api_state=self.tool_manager.get_api_state() if self._python_tools_available else None,
                 )
+                think_step.step_number = step_counter
+                trajectory.append(think_step)
 
-                print(f" Output: {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
+            # Generate refuse arguments
+            step_counter += 1
+            refuse_tools_str = self._get_tools_with_params_str(
+                category=getattr(self, '_refusal_focus_category', None),
+            )
+            refuse_args, _ = self._generate_refuse_arguments(
+                query=query_result.query, refusal_type=query_result.refusal_type,
+                trajectory=trajectory,
+                tools_with_descriptions=refuse_tools_str,
+            )
+            refuse_output = {"refused": True, "reason": refuse_args.get("reason"), "explanation": refuse_args.get("explanation")}
+            refuse_call = ToolCallWithOutput(
+                tool_name="refuse", arguments=refuse_args, output=refuse_output,
+            )
+            trajectory.append(TrajectoryStep(
+                step_number=step_counter, tool_calls=[refuse_call],
+                reasoning=f"Refused: {refuse_args.get('reason')}",
+            ))
+            print(f" ✓ Refused: {refuse_args.get('reason')} - {refuse_args.get('explanation')}")
+            return trajectory, execution_context
 
-                # Check for tool errors
+        # ── Normal query: iterate action_plan ──
+        action_plan = query_result.action_plan if query_result.action_plan else [[t] for t in query_result.expected_tools]
+
+        for plan_step in action_plan:
+            tool_names = plan_step if isinstance(plan_step, list) else [plan_step]
+            is_parallel = len(tool_names) > 1
+            label = " + ".join(tool_names) if is_parallel else tool_names[0]
+            print(f"\n[Action step: {label}]")
+
+            # ── Generate think step ──
+            if self.enable_think:
+                step_counter += 1
+                print(f" [Think {step_counter}]")
+                pre_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+                think_step = self._generate_think_step(
+                    query=query_result.query, trajectory=trajectory,
+                    execution_context=execution_context,
+                    upcoming_tools=tool_names,
+                    current_api_state=pre_state,
+                )
+                think_step.step_number = step_counter
+                trajectory.append(think_step)
+
+            # ── Generate tool call(s) ──
+            if is_parallel:
+                step_counter, success = self._execute_parallel_tools(
+                    tool_names=tool_names, step_counter=step_counter,
+                    query_result=query_result, trajectory=trajectory,
+                    execution_context=execution_context, max_retries=max_retries_per_tool,
+                    query_seed=query_seed,
+                )
+                if not success:
+                    return None, None
+            else:
+                tool_name = tool_names[0]
+                step_counter, success = self._execute_single_tool(
+                    tool_name=tool_name, step_counter=step_counter,
+                    query_result=query_result, trajectory=trajectory,
+                    execution_context=execution_context, max_retries=max_retries_per_tool,
+                    query_seed=query_seed,
+                )
+                if not success:
+                    return None, None
+
+        return trajectory, execution_context
+
+    def _execute_single_tool(self, tool_name: str, step_counter: int,
+                              query_result: QueryGenerationResult, trajectory: List[TrajectoryStep],
+                              execution_context: Dict[str, Any], max_retries: int,
+                              query_seed: Optional[dict] = None) -> Tuple[int, bool]:
+        """Execute a single tool with retries. Returns (new_step_counter, success)."""
+        tool_feedback = ""
+
+        for attempt in range(max_retries):
+            print(f" [Attempt {attempt + 1}/{max_retries}] tool: {tool_name}")
+
+            pre_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+
+            arguments, error = self._generate_tool_arguments(
+                tool_name=tool_name, query=query_result.query, trajectory=trajectory,
+                execution_context=execution_context,
+                feedback=tool_feedback if tool_feedback else None,
+                current_api_state=pre_state, query_seed=query_seed,
+            )
+
+            if error:
+                print(f" ✗ {error}")
+                if attempt < max_retries - 1:
+                    continue
+                return step_counter, False
+
+            print(f" Arguments: {json.dumps(arguments)}")
+            output = self._simulate_tool_execution(tool_name=tool_name, arguments=arguments, execution_context=execution_context)
+            print(f" Output: {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
+
+            if isinstance(output, dict):
+                has_error, error_detail = self._detect_tool_error(tool_name, output)
+                if has_error:
+                    error_type = output.get('error_type', 'execution_error')
+                    print(f" ✗ Tool returned error: {error_detail}")
+                    if error_type == 'validation_failure' and attempt < max_retries - 1:
+                        tool_feedback = f"Previous output validation failed: {error_detail}. Generate new arguments."
+                        continue
+                    elif attempt < max_retries - 1:
+                        tool_feedback = f"Previous call failed: {error_detail}. Try different arguments."
+                        continue
+                    return step_counter, False
+
+            tool_schema = self.tool_manager.get_tool_schema(tool_name)
+            if tool_schema and self.validate_outputs:
+                expected_type = tool_schema.get('output_type', 'unknown')
+                expected_desc = tool_schema.get('output_description', '')
+                validation = self.verify_output_consistency(tool_name, step_counter + 1, output, expected_type, expected_desc)
+                if not validation['output_type_matches'] or validation.get('issues'):
+                    issues_str = '; '.join(validation.get('issues', ['Type mismatch']))
+                    print(f" ✗ Output validation failed: {issues_str}")
+                    if attempt < max_retries - 1:
+                        tool_feedback = f"Previous output failed validation: {issues_str}. Expected type: {expected_type}."
+                        continue
+                    print(f" Max retries exceeded, proceeding with potentially invalid output")
+
+            post_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+
+            state_verification = None
+            if pre_state is not None and post_state is not None:
+                print(f" Verifying state transition for {tool_name}...")
+                state_verification = self.verify_state_transition(
+                    tool_name=tool_name, tool_arguments=arguments, tool_output=output,
+                    pre_state=pre_state, post_state=post_state,
+                )
+                if state_verification.is_valid:
+                    print(f" ✓ State verification passed")
+                else:
+                    issues_joined = '; '.join(state_verification.issues)
+                    print(f" ✗ State verification FAILED: {issues_joined}")
+                    if attempt < max_retries - 1:
+                        tool_feedback = f"State verification failed: {issues_joined}. Judge: {state_verification.reasoning}."
+                        self._replay_state(trajectory)
+                        continue
+                    print(f" Max retries exceeded, proceeding despite state verification failure")
+
+            # SUCCESS
+            print(f" ✓ Tool execution successful: {tool_name}")
+            if isinstance(output, dict):
+                for k, v in output.items():
+                    execution_context[f"{tool_name}_{k}"] = v
+                if 'access_token' in output:
+                    execution_context['access_token'] = output['access_token']
+            execution_context[f"{tool_name}_output"] = output
+
+            step_counter += 1
+            tool_call = ToolCallWithOutput(tool_name=tool_name, arguments=arguments, output=output)
+            trajectory_step = TrajectoryStep(
+                step_number=step_counter, tool_calls=[tool_call],
+                reasoning=f"Called {tool_name} with generated arguments",
+                pre_state=pre_state, post_state=post_state, state_verification=state_verification,
+            )
+            trajectory.append(trajectory_step)
+            return step_counter, True
+
+        print(f"\n✗ Tool {tool_name} failed after {max_retries} attempts")
+        return step_counter, False
+
+    def _execute_parallel_tools(self, tool_names: List[str], step_counter: int,
+                                 query_result: QueryGenerationResult, trajectory: List[TrajectoryStep],
+                                 execution_context: Dict[str, Any], max_retries: int,
+                                 query_seed: Optional[dict] = None) -> Tuple[int, bool]:
+        """Execute multiple parallel tools in one step. Returns (new_step_counter, success)."""
+        tool_feedback = ""
+
+        for attempt in range(max_retries):
+            print(f" [Attempt {attempt + 1}/{max_retries}] parallel: {' + '.join(tool_names)}")
+
+            pre_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+
+            args_map, error = self._generate_parallel_arguments(
+                tool_names=tool_names, query=query_result.query, trajectory=trajectory,
+                execution_context=execution_context, current_api_state=pre_state, query_seed=query_seed,
+            )
+
+            if error:
+                print(f" ✗ {error}")
+                if attempt < max_retries - 1:
+                    continue
+                return step_counter, False
+
+            # Execute each tool sequentially (they should be independent)
+            tool_calls = []
+            any_error = False
+            for idx, tn in enumerate(tool_names):
+                raw_args = args_map.get(tn, {})
+                if isinstance(raw_args, list):
+                    raw_args = raw_args[idx] if idx < len(raw_args) and isinstance(raw_args[idx], dict) else (raw_args[0] if raw_args and isinstance(raw_args[0], dict) else {})
+                if not isinstance(raw_args, dict):
+                    raw_args = {}
+                args = raw_args
+                print(f" Simulating {tn} with args: {json.dumps(args)}")
+                output = self._simulate_tool_execution(tool_name=tn, arguments=args, execution_context=execution_context)
+                print(f" Output ({tn}): {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
+
                 if isinstance(output, dict):
-                    has_error, error_detail = self._detect_tool_error(tool_name, output)
+                    has_error, error_detail = self._detect_tool_error(tn, output)
                     if has_error:
-                        error_type = output.get('error_type', 'execution_error')
-                        print(f" ✗ Tool returned error: {error_detail}")
-                        if error_type == 'validation_failure' and attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous output validation failed: {error_detail}. Generate new arguments."
-                            print(f" Retrying due to validation failure...")
-                            continue
-                        elif attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous call failed: {error_detail}. Try different arguments or check prerequisites (e.g., login first, use correct IDs from API state)."
-                            print(f" Retrying with feedback...")
-                            continue
+                        print(f" ✗ {tn} error: {error_detail}")
+                        tool_feedback = f"Tool {tn} failed: {error_detail}."
+                        any_error = True
                         break
 
-                # Validate output against declared type/description immediately
-                tool_schema = self.tool_manager.get_tool_schema(tool_name)
-                if tool_schema and self.validate_outputs:
-                    expected_type = tool_schema.get('output_type', 'unknown')
-                    expected_desc = tool_schema.get('output_description', '')
-                    validation = self.verify_output_consistency(
-                        tool_name, step_num, output, expected_type, expected_desc
-                    )
-                    if not validation['output_type_matches'] or validation.get('issues'):
-                        issues_str = '; '.join(validation.get('issues', ['Type mismatch']))
-                        print(f" ✗ Output validation failed: {issues_str}")
-                        if attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous output failed validation: {issues_str}. Expected type: {expected_type}."
-                            print(f" Retrying with new arguments...")
-                            continue
-                        print(f" Max retries exceeded, proceeding with potentially invalid output")
-
-                # ── Capture POST state snapshot ──
-                post_state = self.tool_manager.get_api_state() if self._python_tools_available else None
-
-                # ── LLM-as-judge state verification ──
-                state_verification = None
-                if pre_state is not None and post_state is not None:
-                    print(f" Verifying state transition for {tool_name}...")
-                    state_verification = self.verify_state_transition(
-                        tool_name=tool_name,
-                        tool_arguments=arguments,
-                        tool_output=output,
-                        pre_state=pre_state,
-                        post_state=post_state,
-                    )
-                    if state_verification.is_valid:
-                        print(f" ✓ State verification passed: {state_verification.state_changes_summary}")
-                    else:
-                        issues_joined = '; '.join(state_verification.issues)
-                        print(f" ✗ State verification FAILED: {issues_joined}")
-                        if attempt < max_retries_per_tool - 1:
-                            tool_feedback = (
-                                f"State verification failed: {issues_joined}. "
-                                f"Judge reasoning: {state_verification.reasoning}. "
-                                f"Generate different arguments."
-                            )
-                            print(f" Retrying due to state verification failure...")
-                            # Roll back state by re-initializing + replaying completed steps
-                            self._replay_state(trajectory)
-                            continue
-                        print(f" Max retries exceeded, proceeding despite state verification failure")
-
-                # SUCCESS: Tool completed - add to trajectory
-                print(f" ✓ Tool execution successful")
-
-                # Update execution context
                 if isinstance(output, dict):
                     for k, v in output.items():
-                        execution_context[f"{tool_name}_{k}"] = v
-                    # Store access_token directly for convenience (critical for auth-gated tools)
-                    if 'access_token' in output:
-                        execution_context['access_token'] = output['access_token']
-                execution_context[f"{tool_name}_output"] = output
+                        execution_context[f"{tn}_{k}"] = v
+                execution_context[f"{tn}_output"] = output
 
-                # Add to trajectory (with state snapshots + verification)
-                tool_call = ToolCallWithOutput(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    output=output
-                )
-                trajectory_step = TrajectoryStep(
-                    step_number=step_num,
-                    tool_calls=[tool_call],
-                    reasoning=f"Generated arguments for {tool_name} based on query context",
-                    pre_state=pre_state,
-                    post_state=post_state,
-                    state_verification=state_verification,
-                )
-                trajectory.append(trajectory_step)
-                step_success = True
-                break
+                tool_calls.append(ToolCallWithOutput(tool_name=tn, arguments=args, output=output))
 
-            if not step_success:
-                print(f"\n✗ Tool {tool_name} failed after {max_retries_per_tool} attempts")
-                return None, None
+            if any_error:
+                if attempt < max_retries - 1:
+                    self._replay_state(trajectory)
+                    continue
+                return step_counter, False
 
-        # All tools completed successfully
-        return trajectory, execution_context
+            post_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+
+            step_counter += 1
+            trajectory_step = TrajectoryStep(
+                step_number=step_counter, tool_calls=tool_calls,
+                reasoning=f"Called {', '.join(tool_names)} in parallel",
+                pre_state=pre_state, post_state=post_state,
+            )
+            trajectory.append(trajectory_step)
+            print(f" ✓ Parallel tools successful: {' + '.join(tool_names)}")
+            return step_counter, True
+
+        print(f"\n✗ Parallel tools {' + '.join(tool_names)} failed after {max_retries} attempts")
+        return step_counter, False
 
     def _replay_state(self, trajectory: List[TrajectoryStep]) -> None:
         """Re-initialize API state and replay all completed trajectory steps.
@@ -1462,6 +2041,8 @@ Respond JSON: {"arg1": "value1", ...}}"""
         self.tool_manager.initialize_api_state()
         for step in trajectory:
             for tc in step.tool_calls:
+                if tc.tool_name in ("think", "refuse"):
+                    continue
                 if self.tool_manager.has_python_implementation(tc.tool_name):
                     self.tool_manager.invoke_python_tool(tc.tool_name, tc.arguments)
         state = self.tool_manager.get_api_state()
@@ -1584,9 +2165,43 @@ Respond JSON: {"arg1": "value1", ...}}"""
 
     def _generate_final_response(self, query: str, trajectory: List[TrajectoryStep], execution_context: Dict[str, Any]) -> str:
         """Generate a natural final response based on the conversation."""
+        # Check for refusal
+        has_refusal = any(tc.tool_name == "refuse" for step in trajectory for tc in step.tool_calls)
+        if has_refusal:
+            refuse_call = None
+            for step in trajectory:
+                for tc in step.tool_calls:
+                    if tc.tool_name == "refuse":
+                        refuse_call = tc
+                        break
+            if refuse_call:
+                reason = refuse_call.arguments.get("reason", "unknown")
+                explanation = refuse_call.arguments.get("explanation", "")
+                prompt = f"""Based on the following conversation, generate a natural refusal response.
+
+User Query: {query}
+
+The assistant refused the request because: {reason}
+Explanation: {explanation}
+
+Generate a polite, helpful response that:
+1. Acknowledges the user's request
+2. Explains why it cannot be fulfilled
+3. Suggests what information or alternative the user could provide
+
+Respond with only the response text, no JSON."""
+                try:
+                    response = self._safe_llm_generate([{"role": "user", "content": prompt}])
+                    return response.strip()
+                except Exception:
+                    return f"I'm sorry, but I cannot fulfill this request: {explanation}"
+
+        # Normal response (skip think steps in summary)
         actions_summary = []
         for step in trajectory:
             for tc in step.tool_calls:
+                if tc.tool_name == "think":
+                    continue
                 actions_summary.append({
                     "tool": tc.tool_name,
                     "arguments": tc.arguments,
@@ -1871,11 +2486,15 @@ Respond ONLY with valid JSON:
         """Run all verification checks on a generated datapoint."""
         print("\n  Running Verification...")
 
+        PSEUDO = {"think", "refuse"}
+
         # 1. Check tool relevance
         tool_relevance_checks = []
         all_relevant = True
         for step in trajectory:
             for tc in step.tool_calls:
+                if tc.tool_name in PSEUDO:
+                    continue
                 check = self.verify_tool_relevance(query, tc.tool_name, step)
                 tool_relevance_checks.append(check)
                 if not check['is_relevant']:
@@ -1889,6 +2508,8 @@ Respond ONLY with valid JSON:
         all_outputs_valid = True
         for step in trajectory:
             for tc in step.tool_calls:
+                if tc.tool_name in PSEUDO:
+                    continue
                 tool_schema = self.tool_manager.get_tool_schema(tc.tool_name)
                 expected_type = tool_schema.get('output_type', 'unknown') if tool_schema else 'unknown'
                 expected_desc = tool_schema.get('output_description', '') if tool_schema else ''

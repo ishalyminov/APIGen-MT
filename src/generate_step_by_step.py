@@ -150,6 +150,34 @@ def parse_args():
         help='Use diverse config pool for initial API states (default: True). Use --no-config-pool to disable.'
     )
 
+    parser.add_argument(
+        '--enable-think',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Enable think tool (reasoning before each tool call). Default: True.'
+    )
+
+    parser.add_argument(
+        '--allow-refusal',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Allow refusal queries (unanswerable queries that trigger refuse tool). Default: True.'
+    )
+
+    parser.add_argument(
+        '--refusal-rate',
+        type=float,
+        default=0.12,
+        help='Fraction of queries that are intentionally unanswerable (default: 0.12 = 12%%).'
+    )
+
+    parser.add_argument(
+        '--parallel-prob',
+        type=float,
+        default=0.25,
+        help='Probability hint for parallel tool steps in action plan (default: 0.25).'
+    )
+
     return parser.parse_args()
 
 
@@ -178,7 +206,11 @@ def run_step_by_step(args, llm_client, tool_manager, categories, output_path, ju
         llm_client=llm_client,
         tool_manager=tool_manager,
         num_actions=args.num_actions,
-        judge_client=judge_client
+        judge_client=judge_client,
+        enable_think=getattr(args, 'enable_think', True),
+        allow_refusal=getattr(args, 'allow_refusal', True),
+        refusal_rate=getattr(args, 'refusal_rate', 0.12),
+        parallel_prob=getattr(args, 'parallel_prob', 0.25),
     )
 
     datapoints = []
@@ -245,6 +277,11 @@ def run_multi_turn(args, llm_client, tool_manager, categories, output_path):
 
         focus_category = random.choice(categories)
         print(f"Focus category: {focus_category}")
+
+        if args.num_actions_range:
+            num_actions = random.randint(args.num_actions_range[0], args.num_actions_range[1])
+            generator.num_actions = num_actions
+            print(f"Actions for this datapoint: {num_actions}")
 
         dp = generator.generate_multi_turn_datapoint(focus_category=focus_category)
 

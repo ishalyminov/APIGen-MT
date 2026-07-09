@@ -21,18 +21,21 @@ class TokenUsage:
     def __init__(self):
         self.prompt_tokens = 0
         self.completion_tokens = 0
+        self.reasoning_tokens = 0
         self.total_tokens = 0
 
-    def add(self, prompt: int = 0, completion: int = 0, total: int = 0):
+    def add(self, prompt: int = 0, completion: int = 0, total: int = 0, reasoning: int = 0):
         """Add token counts from a single LLM call."""
         self.prompt_tokens += prompt
         self.completion_tokens += completion
+        self.reasoning_tokens += reasoning
         self.total_tokens += total
 
     def to_dict(self) -> dict:
         return {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
             "total_tokens": self.total_tokens
         }
 
@@ -486,7 +489,7 @@ class LocalOpenAILLMClient(LLMClient):
                 else:
                     print(f"[LLMClient] Request failed after {attempt + 1} attempts due to timeout")
                     raise
-            except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError, requests.exceptions.ChunkedEncodingError) as e:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** min(attempt, 8))
                     jitter = _rng.uniform(0, 1.0) * min(delay, 3)
@@ -500,11 +503,17 @@ class LocalOpenAILLMClient(LLMClient):
 
         # Count completion tokens using local tokenizer
         completion_tokens = self.token_counter.count_completion_tokens(response_text)
-        total_tokens = prompt_tokens + completion_tokens
+
+        # Extract and count reasoning tokens (separate from content for reasoning models)
+        reasoning_text = response_obj.get("choices", [{}])[0].get("message", {}).get("reasoning") or ""
+        reasoning_tokens = self.token_counter.count_completion_tokens(reasoning_text) if reasoning_text else 0
+
+        total_tokens = prompt_tokens + completion_tokens + reasoning_tokens
 
         self.token_usage.add(
             prompt=prompt_tokens,
             completion=completion_tokens,
+            reasoning=reasoning_tokens,
             total=total_tokens
         )
         self.total_calls += 1
