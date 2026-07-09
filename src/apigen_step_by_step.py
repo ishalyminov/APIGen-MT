@@ -870,7 +870,9 @@ Respond ONLY with valid JSON:
             """
 
 === RULES ===
-- To add user: user_map.Username = "USR015"
+- To add user: user_map.Username = "USR015" (if user_map has "Username" key, set it to a unique ID like USR015)
+- When message_api or communication tools are expected, CHECK if the query mentions any user names (e.g., "Sarah", "Bob", "Alice", "Emily", "Michael", "David", "Lisa", "Tom", "Raj", "Nina", "John", "Jane", "Emma", etc.)
+- If a user name is mentioned but they don't exist in user_map, ADD them with a unique ID
 - To append to list: "APPEND:array_key": value
 - Set fields directly: "field_name": "value"
 - Never do string operations like "APPEND:foo = bar"
@@ -878,7 +880,7 @@ Respond ONLY with valid JSON:
 
 === EXAMPLES ===
 Add user to message_api:
-{"modifications": {"message_api": {"user_map.Username": "USR015"}}, "reasoning": "..."}
+{"modifications": {"message_api": {"user_map.Sarah": "USR015"}}, "reasoning": "..."}
 
 Append ticket:
 {"modifications": {"ticket_api": {"APPEND:tickets_queue": {"id": 1234}}}, "reasoning": "..."}
@@ -943,8 +945,10 @@ Respond only with valid JSON in one of these formats"""
                 auth_gated_message_tools = {'delete_message', 'search_messages', 'send_message', 'delete_message', 'add_contact', 'get_user_id'}
                 needs_auth = any(tool in auth_gated_message_tools for tool in query_result.expected_tools)
                 current_user = getattr(msg_api, 'current_user', None)
-                if needs_auth and not current_user:
-                    user_map = getattr(msg_api, 'user_map', {})
+                user_map = getattr(msg_api, 'user_map', {})
+                # Check if current_user is valid (exists in user_map)
+                valid_user = current_user and current_user in user_map.values()
+                if needs_auth and not valid_user:
                     if user_map:
                         first_user_id = list(user_map.values())[0] if user_map else None
                         if first_user_id:
