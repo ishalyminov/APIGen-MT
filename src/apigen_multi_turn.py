@@ -86,8 +86,9 @@ class MultiTurnGenerator(StepByStepGenerator):
         num_turns: int = 2,
         actions_per_turn: int = 2,
         validate_outputs: bool = True,
+        enable_parallel: bool = False,
     ):
-        super().__init__(llm_client, tool_manager, actions_per_turn, validate_outputs)
+        super().__init__(llm_client, tool_manager, actions_per_turn, validate_outputs, enable_parallel=enable_parallel)
         self.num_turns = num_turns
 
     # ─────────────────────── Public entry point ───────────────────────

@@ -92,17 +92,19 @@ class QueryGenerationResult(BaseModel):
     query: str
     intent: str
     expected_tools: List[str] = []
+    parallel_groups: List[List[str]] = []
 
 
 class StepByStepGenerator:
     """Generator that creates datapoints step-by-step with immediate tool simulation."""
 
-    def __init__(self, llm_client: LLMClient, tool_manager: ToolManager, num_actions: int = 2, validate_outputs: bool = True, judge_client: LLMClient = None):
+    def __init__(self, llm_client: LLMClient, tool_manager: ToolManager, num_actions: int = 2, validate_outputs: bool = True, judge_client: LLMClient = None, enable_parallel: bool = False):
         self.llm = llm_client
         self.judge = judge_client or llm_client
         self.tool_manager = tool_manager
         self.num_actions = num_actions
         self.validate_outputs = validate_outputs
+        self.enable_parallel = enable_parallel
         self._python_tools_available = bool(tool_manager.python_tool_instances)
         self._accumulated_prompt_tokens: int = 0
         self._accumulated_completion_tokens: int = 0
@@ -402,9 +404,12 @@ Do NOT use "Michael Smith", "John", or generic American names — use {p['name']
             if accumulated_feedback:
                 prompt += f"\n=== FEEDBACK ===\n{accumulated_feedback}\n"
             prompt += f"""
-=== TASK ===
-Generate query requiring EXACTLY {self.num_actions} tools. Respond JSON:
-{{"query": "specific with names/IDs", "intent": "what user wants", "expected_tools": ["tool1", ...]}}"""
+ === TASK ===
+ Generate query requiring EXACTLY {self.num_actions} tools. Also analyze which tools can run in parallel.
+ Group tools that are independent (different APIs, no shared state) into the same step.
+
+ Respond JSON:
+ {{"query": "specific with names/IDs", "intent": "what user wants", "expected_tools": ["tool1", ...], "parallel_groups": [["tool1", "tool2"], ["tool3"]]}}"""
 
             try:
                 response = self._safe_llm_generate([{"role": "user", "content": prompt}])
@@ -424,20 +429,31 @@ Generate query requiring EXACTLY {self.num_actions} tools. Respond JSON:
                 query = result.get("query", "")
                 intent = result.get("intent", "")
                 expected_tools = result.get("expected_tools", [])
+                parallel_groups = result.get("parallel_groups", [])
 
                 print(f" Generated Query: {query}")
                 print(f" Intent: {intent}")
                 print(f" Expected tools: {expected_tools}")
+                print(f" Parallel groups: {parallel_groups}")
 
                 generated_summary = f"""--- ATTEMPT {attempt + 1} OUTPUT ---
 Query: {query}
 Intent: {intent}
-Expected tools: {expected_tools}"""
+Expected tools: {expected_tools}
+Parallel groups: {parallel_groups}"""
 
                 if len(expected_tools) != self.num_actions:
                     print(f" ✗ Wrong tool count: {len(expected_tools)} != {self.num_actions}")
                     accumulated_feedback += f"\n{generated_summary}\nFAILURE: Expected {self.num_actions} tools, but got {len(expected_tools)}.\n--- END ATTEMPT {attempt + 1} ---"
                     continue
+
+                # Validate parallel_groups if present
+                if parallel_groups:
+                    flat_groups = [t for g in parallel_groups for t in g]
+                    if set(flat_groups) != set(expected_tools):
+                        print(f" ✗ parallel_groups doesn't match expected_tools")
+                        accumulated_feedback += f"\n{generated_summary}\nFAILURE: parallel_groups must contain same tools as expected_tools.\n--- END ATTEMPT {attempt + 1} ---"
+                        continue
 
                 all_tools_valid = True
                 invalid_tools = []
@@ -473,7 +489,11 @@ Available tools (sample): {available_tools[:15]}
                         continue
 
                 print(f" ✓ Query generation successful")
-                return QueryGenerationResult(query=query, intent=intent, expected_tools=expected_tools)
+                # If parallel_groups empty, fall back to sequential (each tool its own group)
+                if not parallel_groups:
+                    parallel_groups = [[t] for t in expected_tools]
+                    print(f"  No parallel_groups from LLM, using sequential fallback: {parallel_groups}")
+                return QueryGenerationResult(query=query, intent=intent, expected_tools=expected_tools, parallel_groups=parallel_groups)
 
             except json.JSONDecodeError as e:
                 print(f" ✗ JSON decode error: {e}")
@@ -1315,7 +1335,7 @@ Do NOT generate multiple JSON objects. Do NOT generate a list. Generate ONLY one
                                initial_execution_context: Optional[Dict[str, Any]] = None) -> Optional[Tuple[List[TrajectoryStep], Dict[str, Any]]]:
         """
         Stage 2: Generate tool invocations tool-by-tool.
-        Uses expected_tools from Stage 1 directly - no LLM selection needed.
+        Uses parallel_groups from Stage 1 to determine which tools run together.
         - Each tool has its own retry count for argument generation
         - Feedback is wiped on successful tool completion
         - Captures pre/post API state snapshots around each tool call
@@ -1326,8 +1346,15 @@ Do NOT generate multiple JSON objects. Do NOT generate a list. Generate ONLY one
         trajectory: List[TrajectoryStep] = []
         execution_context: Dict[str, Any] = initial_execution_context.copy() if initial_execution_context else {}
 
-        for step_num, tool_name in enumerate(query_result.expected_tools, 1):
-            print(f"\n[Step {step_num}/{self.num_actions}] Processing tool: {tool_name}")
+        # Use parallel_groups if enable_parallel is True, otherwise each tool is its own group
+        if self.enable_parallel and query_result.parallel_groups:
+            parallel_groups = query_result.parallel_groups
+        else:
+            parallel_groups = [[t] for t in query_result.expected_tools]
+
+        for step_num, tool_group in enumerate(parallel_groups, 1):
+            group_size = len(tool_group)
+            print(f"\n[Step {step_num}/{len(parallel_groups)}] Processing {group_size} tool(s): {tool_group}")
 
             tool_feedback = ""
             step_success = False
@@ -1338,137 +1365,159 @@ Do NOT generate multiple JSON objects. Do NOT generate a list. Generate ONLY one
                 # ── Capture PRE state snapshot ──
                 pre_state = self.tool_manager.get_api_state() if self._python_tools_available else None
 
-                # Generate arguments for this tool (with feedback from previous failures)
-                print(f"  Generating arguments for {tool_name}...")
-                arguments, error = self._generate_tool_arguments(
-            tool_name=tool_name,
-            query=query_result.query,
-            trajectory=trajectory,
-            execution_context=execution_context,
-            feedback=tool_feedback if tool_feedback else None,
-            current_api_state=pre_state,
-            query_seed=query_seed,
-        )
+                # Generate arguments for each tool in the group
+                tool_args_map = {}
+                all_args_generated = True
+                for tool_name in tool_group:
+                    print(f"  Generating arguments for {tool_name}...")
+                    arguments, error = self._generate_tool_arguments(
+                        tool_name=tool_name,
+                        query=query_result.query,
+                        trajectory=trajectory,
+                        execution_context=execution_context,
+                        feedback=tool_feedback if tool_feedback else None,
+                        current_api_state=pre_state,
+                        query_seed=query_seed,
+                    )
 
-                if error:
-                    print(f" ✗ {error}")
+                    if error:
+                        print(f" ✗ {error}")
+                        all_args_generated = False
+                        break
+                    tool_args_map[tool_name] = arguments
+                    print(f"   {tool_name}: {json.dumps(arguments)}")
+
+                if not all_args_generated:
                     if attempt < max_retries_per_tool - 1:
                         continue
                     break
 
-                print(f" Arguments: {json.dumps(arguments)}")
+                # Execute each tool sequentially (grouped under same TrajectoryStep)
+                tool_calls = []
+                group_post_state = None
+                all_success = True
 
-                # Simulate tool execution
-                print(f" Simulating {tool_name}...")
-                try:
-                    output = self._simulate_tool_execution(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        execution_context=execution_context
-                    )
-                except ToolInputError as e:
-                    print(f" ✗ Input validation failed for {tool_name}: {e.errors}")
-                    if attempt < max_retries_per_tool - 1:
-                        tool_feedback = (
-                            f"INVALID INPUT SCHEMA for {tool_name}. "
-                            f"Validation errors: {e.errors}. "
-                            f"Expected parameters for {tool_name}: {list(self.tool_manager._tool_input_schemas.get(tool_name, {}).model_fields.keys()) if hasattr(self.tool_manager, '_tool_input_schemas') else 'unknown'}. "
-                            f"Generate CORRECT arguments matching the schema."
+                for tool_name, arguments in tool_args_map.items():
+                    print(f" Simulating {tool_name}...")
+                    try:
+                        output = self._simulate_tool_execution(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            execution_context=execution_context
                         )
-                        print(f" Retrying due to input validation failure...")
-                        continue
-                    output = {"error": f"Input validation failed after {max_retries_per_tool} attempts: {e.errors}"}
-
-                print(f" Output: {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
-
-                # Check for tool errors
-                if isinstance(output, dict):
-                    has_error, error_detail = self._detect_tool_error(tool_name, output)
-                    if has_error:
-                        error_type = output.get('error_type', 'execution_error')
-                        print(f" ✗ Tool returned error: {error_detail}")
-                        if error_type == 'validation_failure' and attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous output validation failed: {error_detail}. Generate new arguments."
-                            print(f" Retrying due to validation failure...")
-                            continue
-                        elif attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous call failed: {error_detail}. Try different arguments or check prerequisites (e.g., login first, use correct IDs from API state)."
-                            print(f" Retrying with feedback...")
-                            continue
-                        break
-
-                # Validate output against declared type/description immediately
-                tool_schema = self.tool_manager.get_tool_schema(tool_name)
-                if tool_schema and self.validate_outputs:
-                    expected_type = tool_schema.get('output_type', 'unknown')
-                    expected_desc = tool_schema.get('output_description', '')
-                    validation = self.verify_output_consistency(
-                        tool_name, step_num, output, expected_type, expected_desc
-                    )
-                    if not validation['output_type_matches'] or validation.get('issues'):
-                        issues_str = '; '.join(validation.get('issues', ['Type mismatch']))
-                        print(f" ✗ Output validation failed: {issues_str}")
-                        if attempt < max_retries_per_tool - 1:
-                            tool_feedback = f"Previous output failed validation: {issues_str}. Expected type: {expected_type}."
-                            print(f" Retrying with new arguments...")
-                            continue
-                        print(f" Max retries exceeded, proceeding with potentially invalid output")
-
-                # ── Capture POST state snapshot ──
-                post_state = self.tool_manager.get_api_state() if self._python_tools_available else None
-
-                # ── LLM-as-judge state verification ──
-                state_verification = None
-                if pre_state is not None and post_state is not None:
-                    print(f" Verifying state transition for {tool_name}...")
-                    state_verification = self.verify_state_transition(
-                        tool_name=tool_name,
-                        tool_arguments=arguments,
-                        tool_output=output,
-                        pre_state=pre_state,
-                        post_state=post_state,
-                    )
-                    if state_verification.is_valid:
-                        print(f" ✓ State verification passed: {state_verification.state_changes_summary}")
-                    else:
-                        issues_joined = '; '.join(state_verification.issues)
-                        print(f" ✗ State verification FAILED: {issues_joined}")
+                    except ToolInputError as e:
+                        print(f" ✗ Input validation failed for {tool_name}: {e.errors}")
                         if attempt < max_retries_per_tool - 1:
                             tool_feedback = (
-                                f"State verification failed: {issues_joined}. "
-                                f"Judge reasoning: {state_verification.reasoning}. "
-                                f"Generate different arguments."
+                                f"INVALID INPUT SCHEMA for {tool_name}. "
+                                f"Validation errors: {e.errors}. "
+                                f"Expected parameters for {tool_name}: {list(self.tool_manager._tool_input_schemas.get(tool_name, {}).model_fields.keys()) if hasattr(self.tool_manager, '_tool_input_schemas') else 'unknown'}. "
+                                f"Generate CORRECT arguments matching the schema."
                             )
-                            print(f" Retrying due to state verification failure...")
-                            # Roll back state by re-initializing + replaying completed steps
-                            self._replay_state(trajectory)
-                            continue
-                        print(f" Max retries exceeded, proceeding despite state verification failure")
+                            print(f" Retrying due to input validation failure...")
+                            all_success = False
+                            break
+                        output = {"error": f"Input validation failed after {max_retries_per_tool} attempts: {e.errors}"}
 
-                # SUCCESS: Tool completed - add to trajectory
-                print(f" ✓ Tool execution successful")
+                    print(f" Output: {json.dumps(output, indent=2, ensure_ascii=False) if isinstance(output, (dict, list)) else output}")
 
-                # Update execution context
-                if isinstance(output, dict):
-                    for k, v in output.items():
-                        execution_context[f"{tool_name}_{k}"] = v
-                    # Store access_token directly for convenience (critical for auth-gated tools)
-                    if 'access_token' in output:
-                        execution_context['access_token'] = output['access_token']
-                execution_context[f"{tool_name}_output"] = output
+                    # Check for tool errors
+                    if isinstance(output, dict):
+                        has_error, error_detail = self._detect_tool_error(tool_name, output)
+                        if has_error:
+                            error_type = output.get('error_type', 'execution_error')
+                            print(f" ✗ Tool returned error: {error_detail}")
+                            if error_type == 'validation_failure' and attempt < max_retries_per_tool - 1:
+                                tool_feedback = f"Previous output validation failed: {error_detail}. Generate new arguments."
+                                print(f" Retrying due to validation failure...")
+                                all_success = False
+                                break
+                            elif attempt < max_retries_per_tool - 1:
+                                tool_feedback = f"Previous call failed: {error_detail}. Try different arguments or check prerequisites (e.g., login first, use correct IDs from API state)."
+                                print(f" Retrying with feedback...")
+                                all_success = False
+                                break
+                            all_success = False
+                            break
 
-                # Add to trajectory (with state snapshots + verification)
-                tool_call = ToolCallWithOutput(
-                    tool_name=tool_name,
-                    arguments=arguments,
-                    output=output
-                )
+                    # Validate output against declared type/description immediately
+                    tool_schema = self.tool_manager.get_tool_schema(tool_name)
+                    if tool_schema and self.validate_outputs:
+                        expected_type = tool_schema.get('output_type', 'unknown')
+                        expected_desc = tool_schema.get('output_description', '')
+                        validation = self.verify_output_consistency(
+                            tool_name, step_num, output, expected_type, expected_desc
+                        )
+                        if not validation['output_type_matches'] or validation.get('issues'):
+                            issues_str = '; '.join(validation.get('issues', ['Type mismatch']))
+                            print(f" ✗ Output validation failed: {issues_str}")
+                            if attempt < max_retries_per_tool - 1:
+                                tool_feedback = f"Previous output failed validation: {issues_str}. Expected type: {expected_type}."
+                                print(f" Retrying with new arguments...")
+                                all_success = False
+                                break
+                            print(f" Max retries exceeded, proceeding with potentially invalid output")
+
+                    # Update execution context
+                    if isinstance(output, dict):
+                        for k, v in output.items():
+                            execution_context[f"{tool_name}_{k}"] = v
+                        if 'access_token' in output:
+                            execution_context['access_token'] = output['access_token']
+                    execution_context[f"{tool_name}_output"] = output
+
+                    # Track post state after each tool
+                    group_post_state = self.tool_manager.get_api_state() if self._python_tools_available else None
+
+                    tool_calls.append(ToolCallWithOutput(
+                        tool_name=tool_name,
+                        arguments=arguments,
+                        output=output
+                    ))
+
+                if not all_success:
+                    if attempt < max_retries_per_tool - 1:
+                        continue
+                    break
+
+                # ── LLM-as-judge state verification (for the group) ──
+                state_verification = None
+                if pre_state is not None and group_post_state is not None:
+                    # For parallel groups, verify all tools in the group
+                    for tc in tool_calls:
+                        print(f" Verifying state transition for {tc.tool_name}...")
+                        sv = self.verify_state_transition(
+                            tool_name=tc.tool_name,
+                            tool_arguments=tc.arguments,
+                            tool_output=tc.output,
+                            pre_state=pre_state,
+                            post_state=group_post_state,
+                        )
+                        if not sv.is_valid:
+                            issues_joined = '; '.join(sv.issues)
+                            print(f" ✗ State verification FAILED: {issues_joined}")
+                            if attempt < max_retries_per_tool - 1:
+                                tool_feedback = (
+                                    f"State verification failed: {issues_joined}. "
+                                    f"Judge reasoning: {sv.reasoning}. "
+                                    f"Generate different arguments."
+                                )
+                                print(f" Retrying due to state verification failure...")
+                                self._replay_state(trajectory)
+                                all_success = False
+                                break
+                    if not all_success:
+                        continue
+
+                # SUCCESS: All tools in group completed - add to trajectory
+                print(f" ✓ Tool execution successful ({group_size} tool(s) in group)")
+
                 trajectory_step = TrajectoryStep(
                     step_number=step_num,
-                    tool_calls=[tool_call],
-                    reasoning=f"Generated arguments for {tool_name} based on query context",
+                    tool_calls=tool_calls,
+                    reasoning=f"Generated arguments for {', '.join(tool_group)} based on query context",
                     pre_state=pre_state,
-                    post_state=post_state,
+                    post_state=group_post_state,
                     state_verification=state_verification,
                 )
                 trajectory.append(trajectory_step)
@@ -1476,7 +1525,7 @@ Do NOT generate multiple JSON objects. Do NOT generate a list. Generate ONLY one
                 break
 
             if not step_success:
-                print(f"\n✗ Tool {tool_name} failed after {max_retries_per_tool} attempts")
+                print(f"\n✗ Step {step_num} failed after {max_retries_per_tool} attempts")
                 return None, None
 
         # All tools completed successfully
