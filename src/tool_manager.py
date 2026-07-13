@@ -6,11 +6,21 @@ import os
 import copy
 import inspect
 import importlib
+import re
 from pathlib import Path
 from collections import defaultdict
 
 from llm_client import LLMClient
 from config_pool import generate_random_config
+
+
+class ToolInputError(Exception):
+    """Raised when tool input fails schema validation."""
+
+    def __init__(self, tool_name: str, errors: list):
+        self.tool_name = tool_name
+        self.errors = errors
+        super().__init__(f"Tool '{tool_name}' input validation failed: {errors}")
 
 
 CLASS_KEY_TO_INITIAL_CONFIG_KEY = {
@@ -738,6 +748,8 @@ class ToolManager:
         self.api_name_to_class_key: Dict[str, str] = {}
         # Canonical initial configs for resetting instances
         self._canonical_configs: Dict[str, Dict[str, Any]] = {}
+        # Mapping from tool_name -> Pydantic input schema class
+        self._tool_input_schemas: Dict[str, Any] = {}
 
         # Load tools from file if path is provided
         if tool_pool_path:
@@ -807,6 +819,71 @@ class ToolManager:
         mapped = len(self.api_name_to_class_key)
         print(f"Loaded {loaded} Python tool classes with {mapped} api_name mappings")
 
+        self._build_input_schema_mapping()
+
+    def _build_input_schema_mapping(self) -> None:
+        """Build mapping from tool_name to Pydantic input schema class."""
+        self._tool_input_schemas: Dict[str, Any] = {}
+        try:
+            from tools import schemas as schemas_module
+            for class_key in TOOL_CLASS_KEYS:
+                schemas = self._get_schemas_for_class(class_key, schemas_module)
+                for tool_name, schema_class in schemas.items():
+                    self._tool_input_schemas[tool_name] = schema_class
+        except ImportError as e:
+            print(f"Warning: Could not import schemas module: {e}")
+
+    def _get_schemas_for_class(self, class_key: str, schemas_module: Any) -> Dict[str, Any]:
+        """Get tool_name -> schema class mapping for a given class_key."""
+        schemas = {}
+        schema_prefix_map = {
+            "gorilla_file_system": ["Cat", "Cd", "Cp", "Diff", "Du", "Echo", "Find",
+                                     "Grep", "Ls", "Mkdir", "Mv", "Rm", "Rmdir",
+                                     "Sort", "Tail", "Touch", "Wc"],
+            "math_api": ["AbsoluteValue", "Add", "Divide", "ImperialSiConversion",
+                         "Logarithm", "MaxValue", "Mean", "MinValue", "Multiply",
+                         "Percentage", "Power", "RoundNumber", "SiUnitConversion",
+                         "SquareRoot", "StandardDeviation", "Subtract", "SumValues"],
+            "message_api": ["AddContact", "DeleteMessage", "GetUserId", "MessageLogin",
+                           "SearchMessages", "SendMessage"],
+            "posting_api": ["AuthenticateTwitter", "Comment", "FollowUser", "GetTweet",
+                           "GetTweetComments", "GetUserStats", "GetUserTweets", "Mention",
+                           "PostTweet", "Retweet", "SearchTweets", "UnfollowUser"],
+            "ticket_api": ["CloseTicket", "CreateTicket", "EditTicket", "GetTicket",
+                          "GetUserTickets", "ResolveTicket", "TicketLogin"],
+            "trading_bot": ["AddToWatchlist", "CancelOrder", "FilterStocksByPrice",
+                           "FundAccount", "GetAvailableStocks", "GetOrderDetails",
+                           "GetStockInfo", "GetSymbolByName", "GetTransactionHistory",
+                           "MakeTransaction", "NotifyPriceChange", "PlaceOrder",
+                           "RemoveStockFromWatchlist", "TradingLogin",
+                           "UpdateMarketStatus", "UpdateStockPrice"],
+            "travel_booking": ["AuthenticateTravel", "BookFlight", "CancelBooking",
+                              "ComputeExchangeRate", "ContactCustomerSupport",
+                              "GetBudgetFiscalYear", "GetCreditCardBalance",
+                              "GetFlightCost", "GetNearestAirportByCity",
+                              "PurchaseInsurance", "RegisterCreditCard",
+                              "RetrieveInvoice", "SetBudgetLimit",
+                              "VerifyTravelerInformation"],
+            "vehicle_control": ["ActivateParkingBrake", "AdjustClimateControl",
+                               "DisplayCarStatus", "DisplayLog", "EstimateDistance",
+                               "EstimateDriveFeasibilityByMileage", "FillFuelTank",
+                               "GallonToLiter", "GetZipcodeBasedOnCity", "LiterToGallon",
+                               "LockDoors", "PressBrakePedal", "SetCruiseControl",
+                               "SetHeadlights", "SetNavigation", "StartEngine"],
+        }
+        prefixes = schema_prefix_map.get(class_key, [])
+        for prefix in prefixes:
+            schema_name = f"{prefix}Input"
+            if hasattr(schemas_module, schema_name):
+                schema_class = getattr(schemas_module, schema_name)
+                tool_name = prefix.lower()
+                if prefix.isupper():
+                    tool_name = prefix
+                else:
+                    tool_name = re.sub(r'(?<!^)(?=[A-Z])', '_', prefix).lower()
+                schemas[tool_name] = schema_class
+        return schemas
+
     def reset_python_tool_instances(self) -> None:
         """Reset all Python tool instances to fresh state.
 
@@ -870,7 +947,11 @@ class ToolManager:
             True if a Python implementation is available
         """
         class_key = self.api_name_to_class_key.get(tool_name)
-        return class_key is not None and class_key in self.python_tool_instances
+        if class_key is None or class_key not in self.python_tool_instances:
+            return False
+        instance = self.python_tool_instances[class_key]
+        method = getattr(instance, tool_name, None)
+        return method is not None and callable(method)
 
     def invoke_python_tool(self, tool_name: str, params: Dict[str, Any]) -> Any:
         """Invoke a Python tool implementation directly.
@@ -884,6 +965,7 @@ class ToolManager:
 
         Raises:
             ValueError: If no Python implementation exists for the tool
+            ToolInputError: If input validation fails against schema
         """
         class_key = self.api_name_to_class_key.get(tool_name)
         if class_key is None or class_key not in self.python_tool_instances:
@@ -894,11 +976,53 @@ class ToolManager:
         if method is None or not callable(method):
             raise ValueError(f"Method '{tool_name}' not found on {class_key}")
 
+        validated_params = self._validate_tool_input(tool_name, params)
+        coerced_params = self._coerce_params(method, validated_params)
+        return method(**coerced_params)
+
+    def _validate_tool_input(self, tool_name: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate tool input against Pydantic schema.
+
+        Args:
+            tool_name: The name of the tool
+            params: The raw input parameters
+
+        Returns:
+            Validated parameters
+
+        Raises:
+            ToolInputError: If validation fails
+        """
+        if not self._tool_input_schemas:
+            self._build_input_schema_mapping()
+
+        # Additional validation for Storage tools - reject paths only for mkdir/touch
+        # cd and cp can have paths (cd goes to dir, cp copies file to destination)
+        # But dir_name/file_name must be simple names
+        path_only_fields = {'dir_name', 'file_name'}
+        for field in path_only_fields:
+            if field in params:
+                value = params[field]
+                if isinstance(value, str) and ('/' in value or '\\' in value):
+                    raise ToolInputError(tool_name, [f"'{field}' must be a simple name, not a path. Got: '{value}'"])
+
+        schema_class = self._tool_input_schemas.get(tool_name)
+        if schema_class is None:
+            return params
+
         try:
-            coerced_params = self._coerce_params(method, params)
-            return method(**coerced_params)
+            validated = schema_class(**params)
+            return validated.model_dump()
         except Exception as e:
-            return {"error": str(e)}
+            errors = []
+            if hasattr(e, 'errors'):
+                for err in e.errors():
+                    loc = '.'.join(str(l) for l in err.get('loc', []))
+                    msg = err.get('msg', str(err))
+                    errors.append(f"{loc}: {msg}" if loc else msg)
+            else:
+                errors.append(str(e))
+            raise ToolInputError(tool_name, errors)
 
     @staticmethod
     def _coerce_params(method: Any, params: Dict[str, Any]) -> Dict[str, Any]:

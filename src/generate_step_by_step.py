@@ -150,6 +150,13 @@ def parse_args():
         help='Use diverse config pool for initial API states (default: True). Use --no-config-pool to disable.'
     )
 
+    parser.add_argument(
+        '--parallel',
+        action='store_true',
+        default=False,
+        help='Enable LLM-driven parallel tool grouping when safe (default: False)'
+    )
+
     return parser.parse_args()
 
 
@@ -178,7 +185,8 @@ def run_step_by_step(args, llm_client, tool_manager, categories, output_path, ju
         llm_client=llm_client,
         tool_manager=tool_manager,
         num_actions=args.num_actions,
-        judge_client=judge_client
+        judge_client=judge_client,
+        enable_parallel=args.parallel,
     )
 
     datapoints = []
@@ -232,6 +240,7 @@ def run_multi_turn(args, llm_client, tool_manager, categories, output_path):
         tool_manager=tool_manager,
         num_turns=args.num_turns,
         actions_per_turn=args.num_actions,
+        enable_parallel=args.parallel,
     )
 
     datapoints = []

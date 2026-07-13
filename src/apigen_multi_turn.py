@@ -86,8 +86,9 @@ class MultiTurnGenerator(StepByStepGenerator):
         num_turns: int = 2,
         actions_per_turn: int = 2,
         validate_outputs: bool = True,
+        enable_parallel: bool = False,
     ):
-        super().__init__(llm_client, tool_manager, actions_per_turn, validate_outputs)
+        super().__init__(llm_client, tool_manager, actions_per_turn, validate_outputs, enable_parallel=enable_parallel)
         self.num_turns = num_turns
 
     # ─────────────────────── Public entry point ───────────────────────
@@ -123,6 +124,39 @@ class MultiTurnGenerator(StepByStepGenerator):
         for i, t in enumerate(blueprint.turns, 1):
             uq = t.get('user_query', '')
             print(f"   Turn {i}: {uq[:80]}...")
+
+        # Stage 0.5: Adjust initial API state based on all expected tools in blueprint
+        if self._python_tools_available:
+            all_expected_tools = []
+            all_queries = []
+            for turn in blueprint.turns:
+                all_expected_tools.extend(turn.get('expected_tools', []))
+                all_queries.append(turn.get('user_query', ''))
+
+            if all_expected_tools:
+                print("\n" + "=" * 70)
+                print("STAGE 0.5: Adjust Initial API State for Blueprint Prerequisites")
+                print("=" * 70)
+
+                class BlueprintQueryResult:
+                    def __init__(self, query, expected_tools, all_queries=None):
+                        self.query = query
+                        self.intent = "adjust initial state for blueprint"
+                        self.expected_tools = expected_tools
+                        self.all_queries = all_queries or []
+
+                adj_query = BlueprintQueryResult(
+                    query=f"Multi-turn conversation: {blueprint.overall_task}\n\nQueries:\n" + "\n".join(f"Turn {i+1}: {q}" for i, q in enumerate(all_queries)),
+                    expected_tools=all_expected_tools,
+                    all_queries=all_queries
+                )
+
+                adjusted = self._stage1_5_adjust_initial_state(adj_query)
+                if adjusted:
+                    initial_api_state = self.tool_manager.get_api_state()
+                    print(f" ✓ API state adjusted, re-captured ({len(initial_api_state)} class keys)")
+                else:
+                    print(" ⚠ State adjustment failed or not needed, proceeding with original state")
 
         conversation = MultiTurnConversation(overall_task=blueprint.overall_task)
         execution_context: Dict[str, Any] = {}
@@ -266,8 +300,16 @@ class MultiTurnGenerator(StepByStepGenerator):
                 'get_nearest_airport_by_city': ['success', 'airport_name', 'iata_code', 'distance'],
                 'cancel_booking': ['success', 'cancel_status', 'booking_id'],
                 'retrieve_invoice': ['success', 'invoice_id', 'amount', 'line_items'],
-                'purchase_insurance': ['success', 'insurance_policy_id', 'amount_charged'],
-            }
+'purchase_insurance': ['success', 'insurance_policy_id', 'amount_charged'],
+            },
+            'Communication': {
+                'get_user_id': ['user_id'],
+                'send_message': ['sent_status', 'message_id', 'message'],
+                'delete_message': ['deleted_status', 'message_id', 'message'],
+                'search_messages': ['results'],
+                'add_contact': ['added_status', 'user_id', 'message'],
+                'message_login': ['login_status', 'message'],
+            },
         }
 
         output_fields_str = ""
@@ -287,31 +329,54 @@ class MultiTurnGenerator(StepByStepGenerator):
 
 === CRITICAL: PATH HANDLING ===
 - file_name/dir_name must be simple names, NOT paths (e.g., "config.ini" not "folder/config.ini")
+- NEVER use paths like "src/main.py" or "my_project/src" - these are INVALID
 - To work in a subdirectory: first use cd to navigate there, THEN use file operations
 - Example CORRECT sequence:
   1. mkdir project
-  2. cd project  
-  3. touch file.txt (NOT "project/file.txt")
+  2. cd project
+  3. touch file.txt
+- Example WRONG: mkdir project/src (paths in dir_name are NOT allowed)
+
+=== CRITICAL: OPERATION ORDERING ===
+- BEFORE copying TO a directory: first CREATE the directory with mkdir
+- BEFORE cd'ing into a directory: first CREATE it with mkdir
+- BEFORE using a file_name that shouldn't exist: CREATE it first with touch
+- Example CORRECT: mkdir backup && cp settings.ini backup && cd backup
+- Example WRONG: cp settings.ini backup (creates "backup" as a FILE, then cd backup fails)
+
+=== CRITICAL: COPY OPERATION ===
+- cp copies ONE file to ONE destination
+- To copy multiple files: use multiple cp calls (e.g., cp file1 backup && cp file2 backup)
+- Do NOT do "cp file1 file2 file3 dest" - this is invalid
+- The source argument is always a single file, destination is a directory or new filename
 
 === REQUIREMENTS ===
 1. Each turn: specific entities (IDs, names, dates, prices) + EXACTLY {self.num_actions} tools
 2. Conversation flows naturally, each turn builds on previous
 3. Auth persists across turns - login only in FIRST turn needing auth (don't re-login)
 4. expected_tools: EXACTLY {self.num_actions} tools per turn
-5. Credentials: trader_admin/TradeAdmin2024! (trading), tech_user/TechUser2024! (posting), support_agent/SupportAgent2024! (tickets), travel_client_001/s3cretK3y!/refresh_abc123 (travel), USR005-USR014 (messaging)
+5. Credentials: trader_admin/TradeAdmin2024! (trading), tech_user/TechUser2024! (posting), support_agent/SupportAgent2024! (tickets), travel_client_001/s3cretK3y!/refresh_abc123 (travel), Mom/Dad/Alex/Sam/Grandma (messaging - use names, not IDs)
 6. Cross-turn refs: use EXACT output field names like {{{{TURN1.mkdir.dir_name}}}}, {{{{TURN3.touch.file_name}}}}, etc.
+7. For delete_message: you MUST use {{{{TURN<N>.send_message.message_id}}}} to reference a message_id from a prior turn. Do NOT invent message IDs like msg_789.
 
 === EXAMPLES ===
 - "Log into trading as trader_admin/TradeAdmin2024! and buy 100 MSFT shares." (trading_login, place_order)
 - "Create ticket 'Network outage' with critical priority." (ticket_login, create_ticket)
 - "Post tweet 'Great day for AI!'" (authenticate_twitter, post_tweet)
+- "Send a message to Mom saying 'Happy birthday!'" (message_login, send_message) - use NAMES, not IDs for messaging
 - "Get the user ID for Sarah and send her a message." (get_user_id, send_message)
 
 === OUTPUT ===
 {{"overall_task": "scenario", "turns": [{{"user_query": "request", "expected_tools": ["t1", "t2"]}}, ...]}}"""
 
         if focus_category:
-            prompt += f"\n\nIMPORTANT: Use ONLY tools from '{focus_category}' category. Do NOT use tools from other categories."
+            prompt += f"\n\nIMPORTANT: Use ONLY tools from '{focus_category}' category."
+            if focus_category == 'Storage':
+                prompt += """ STORAGE TOOLS: You MUST use only these EXACT tool names:
+- mkdir, cd, touch, ls, cat, echo, cp, mv, rm, rmdir
+- grep, wc, find, du, tail, sort
+Do NOT use 'head' - it does not exist. Only 'tail' exists for viewing file ends.
+"""
         else:
             prompt += "\n\nYou may use tools from any category."
 
@@ -354,6 +419,11 @@ class MultiTurnGenerator(StepByStepGenerator):
                     # Validate category if focus_category is specified
                     if focus_category:
                         for tool_name in expected:
+                            # First check if tool exists at all
+                            if not self.tool_manager.tool_exists(tool_name):
+                                validation_errors.append(f"Turn {i+1} tool '{tool_name}' does NOT exist. Use only valid tool names from the provided list.")
+                                all_tools_valid = False
+                                break
                             tool_cat = self.tool_manager.get_tool_category(tool_name)
                             if tool_cat != focus_category:
                                 validation_errors.append(f"Turn {i+1} tool '{tool_name}' is from category '{tool_cat}', not '{focus_category}'. Use only {focus_category} tools.")
@@ -393,6 +463,12 @@ class MultiTurnGenerator(StepByStepGenerator):
                                 'cp': ['success', 'message', 'source', 'destination'],
                                 'grep': ['success', 'lines', 'count'],
                                 'wc': ['success', 'lines', 'words', 'chars', 'file_name'],
+                                'get_user_id': ['user_id'],
+                                'send_message': ['sent_status', 'message_id', 'message'],
+                                'delete_message': ['deleted_status', 'message_id', 'message'],
+                                'search_messages': ['results'],
+                                'add_contact': ['added_status', 'user_id', 'message'],
+                                'message_login': ['login_status', 'message'],
                             }
                             known_fields = output_fields_map.get(ref_tool, ['success', 'message', 'id', 'result'])
                             if ref_field not in known_fields:
@@ -409,7 +485,6 @@ class MultiTurnGenerator(StepByStepGenerator):
                     'edit_ticket': ('ticket_id', 'create_ticket'),
                     'resolve_ticket': ('ticket_id', 'create_ticket'),
                     'close_ticket': ('ticket_id', 'create_ticket'),
-                    'delete_message': ('message_id', 'send_message'),
                     'purchase_insurance': ('booking_id', 'book_flight'),
                 }
                 for i, t in enumerate(turns):
