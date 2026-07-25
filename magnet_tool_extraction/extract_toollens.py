@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""
+Extract tools from ToolLens dataset.
+
+ToolLens (Tool-COLT/ToolLens) contains:
+- corpus.jsonl: 464 tool definitions with category, name, description, parameters, return_schema
+- ToolLens_data.json: 18,770 query-API pairs for example usages
+
+Output format similar to bfcl_v3_tools_with_outputs.jsonl for compatibility.
+"""
+
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Tuple
+from collections import defaultdict
+
+# Type normalization from ToolLens informal types to JSON Schema types
+TYPE_MAPPING = {
+    'str': 'string',
+    'bool': 'boolean',
+    'int': 'integer',
+    'float': 'number',
+    'double': 'number',
+    'list of str': 'array',
+    'list of int': 'array',
+    'list of float': 'array',
+    'list of dict': 'array',
+    'empty list': 'array',
+    'object': 'dict',
+}
+
+
+def normalize_type(type_str: str) -> str:
+    """Normalize type string to JSON Schema compatible type."""
+    if not type_str:
+        return 'string'
+
+    type_str = type_str.strip().lower()
+
+    # Check for list types
+    if type_str.startswith('list of '):
+        return 'array'
+
+    # Check for dict/object
+    if type_str in ('dict', 'object', '{}', 'empty object'):
+        return 'dict'
+
+    # Check for null/none
+    if type_str in ('null', 'none', 'nonetype'):
+        return 'null'
+
+    return TYPE_MAPPING.get(type_str, type_str)
+
+
+def parse_toollens_text(text: str) -> Optional[Dict[str, Any]]:
+    """Parse the combined text field from corpus.jsonl into structured data.
+
+    Format: category_name:X, tool_name:Y, api_name:Z, api_description:..., required_params:[...], optional_params:[...], return_schema:{...}
+    """
+    try:
+        result = {}
+
+        # Extract category_name
+        match = re.search(r'category_name:([^,]+)', text)
+        if match:
+            result['category'] = match.group(1).strip()
+
+        # Extract tool_name
+        match = re.search(r'tool_name:([^,]+)', text)
+        if match:
+            result['tool_name'] = match.group(1).strip()
+
+        # Extract api_name
+        match = re.search(r'api_name:([^,]+)', text)
+        if match:
+            result['api_name'] = match.group(1).strip()
+
+        # Extract api_description (everything up to required_params)
+        match = re.search(r'api_description:(.+?)(?:,\s*required_params:|$)', text, re.DOTALL)
+        if match:
+            desc = match.group(1).strip()
+            # Clean up markdown formatting
+            desc = re.sub(r'\*\*([^*]+)\*\*', r'\1', desc)  # Remove bold
+            result['api_description'] = desc
+
+        # Extract required_params (JSON array)
+        match = re.search(r'required_params:\s*(\[[^\]]*\])', text)
+        if match:
+            try:
+                result['required_params'] = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                result['required_params'] = []
+
+        # Extract optional_params (JSON array)
+        match = re.search(r'optional_params:\s*(\[[^\]]*\])', text)
+        if match:
+            try:
+                result['optional_params'] = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                result['optional_params'] = []
+
+        # Extract return_schema (JSON object)
+        match = re.search(r'return_schema:\s*(\{.*\})', text, re.DOTALL)
+        if match:
+            try:
+                result['return_schema'] = json.loads(match.group(1))
+            except json.JSONDecodeError:
+                result['return_schema'] = {}
+
+        return result
+
+    except Exception as e:
+        print(f"Error parsing text: {e}")
+        return None
+
+
+def build_parameters_schema(required_params: List, optional_params: List) -> Dict[str, Any]:
+    """Build JSON Schema for parameters from required and optional param lists."""
+    properties = {}
+    required = []
+
+    # Process required params
+    for param in required_params:
+        name = param.get('name', '')
+        ptype = param.get('type', 'STRING')
+        desc = param.get('description', '')
+
+        if name:
+            properties[name] = {
+                'type': ptype.lower(),
+                'description': desc
+            }
+            required.append(name)
+
+    # Process optional params
+    for param in optional_params:
+        name = param.get('name', '')
+        ptype = param.get('type', 'STRING')
+        desc = param.get('description', '')
+        default = param.get('default')
+
+        if name:
+            prop = {
+                'type': ptype.lower(),
+                'description': desc
+            }
+            if default is not None:
+                prop['default'] = default
+            properties[name] = prop
+
+    schema = {
+        'type': 'object',
+        'properties': properties
+    }
+
+    if required:
+        schema['required'] = required
+
+    return schema
+
+
+def build_output_schema(return_schema: Dict) -> Dict[str, Any]:
+    """Build JSON Schema from return_schema dict."""
+    if not return_schema:
+        return {}
+
+    properties = {}
+    for field, type_val in return_schema.items():
+        if isinstance(type_val, str):
+            normalized = normalize_type(type_val)
+            properties[field] = {
+                'type': normalized,
+                'description': f'Output field: {field}'
+            }
+        elif isinstance(type_val, dict):
+            # Nested object
+            properties[field] = {
+                'type': 'object',
+                'description': f'Output field: {field}',
+                'properties': {}
+            }
+            for nested_field, nested_type in type_val.items():
+                if isinstance(nested_type, str):
+                    properties[field]['properties'][nested_field] = {
+                        'type': normalize_type(nested_type),
+                        'description': f'Nested field: {nested_field}'
+                    }
+
+    return {
+        'type': 'object',
+        'properties': properties
+    }
+
+
+def get_output_type(return_schema: Dict) -> str:
+    """Infer output type from return_schema."""
+    if not return_schema:
+        return 'unknown'
+
+    types_seen = set()
+    for field, type_val in return_schema.items():
+        if isinstance(type_val, str):
+            types_seen.add(normalize_type(type_val))
+        elif isinstance(type_val, dict):
+            types_seen.add('object')
+
+    if len(types_seen) == 1:
+        return list(types_seen)[0]
+    elif 'object' in types_seen:
+        return 'dict'
+    else:
+        return 'mixed'
+
+
+def load_toollens_corpus(corpus_path: Path) -> List[Dict[str, Any]]:
+    """Load and parse corpus.jsonl."""
+    tools = []
+
+    with open(corpus_path) as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+
+            try:
+                entry = json.loads(line)
+                parsed = parse_toollens_text(entry.get('text', ''))
+
+                if parsed:
+                    tools.append(parsed)
+                else:
+                    print(f"Warning: Failed to parse line {line_num}")
+
+            except json.JSONDecodeError as e:
+                print(f"Warning: Invalid JSON at line {line_num}: {e}")
+
+    return tools
+
+
+def load_example_usages(toollens_data_path: Path) -> Dict[str, List[str]]:
+    """Load example usages from ToolLens_data.json.
+
+    Returns:
+        Dict mapping api_name to list of example queries
+    """
+    examples = defaultdict(list)
+
+    with open(toollens_data_path) as f:
+        data = json.load(f)
+
+    for item in data:
+        query = item.get('query', '')
+        if not query:
+            continue
+
+        for api in item.get('apis', []):
+            api_name = api.get('api_name', '')
+            if api_name and len(examples[api_name]) < 5:  # Max 5 examples per API
+                examples[api_name].append(query)
+
+    return dict(examples)
+
+
+def enhance_tool(tool: Dict, examples: Dict[str, List[str]]) -> Dict[str, Any]:
+    """Enhance a tool with full schema information."""
+    api_name = tool.get('api_name', '')
+    category = tool.get('category', 'Unknown')
+    tool_name = tool.get('tool_name', '')
+    api_desc = tool.get('api_description', '')
+    required_params = tool.get('required_params', [])
+    optional_params = tool.get('optional_params', [])
+    return_schema = tool.get('return_schema', {})
+
+    # Build parameters schema
+    parameters = build_parameters_schema(required_params, optional_params)
+
+    # Build output schema
+    output_schema = build_output_schema(return_schema)
+
+    # Get output type
+    output_type = get_output_type(return_schema)
+
+    # Build enhanced tool
+    enhanced = {
+        'category': category,
+        'tool_name': tool_name,
+        'tool_description': f"Functions provided by the {tool_name} toolkit.",
+        'api_name': api_name,
+        'api_description': api_desc,
+        'parameters': parameters,
+        'output_type': output_type,
+        'output_description': f"Returns {output_type} with fields: {', '.join(return_schema.keys()) if return_schema else 'no schema available'}",
+        'output_schema': output_schema,
+        'has_return_schema': bool(return_schema),
+    }
+
+    # Add examples if available
+    if api_name in examples:
+        enhanced['example_queries'] = examples[api_name]
+
+    return enhanced
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Extract tools from ToolLens dataset"
+    )
+    parser.add_argument(
+        "--corpus",
+        default="toollens_data/corpus.jsonl",
+        help="Path to corpus.jsonl"
+    )
+    parser.add_argument(
+        "--toollens-data",
+        default="toollens_data/ToolLens_data.json",
+        help="Path to ToolLens_data.json"
+    )
+    parser.add_argument(
+        "--output",
+        default="toollens_tools.jsonl",
+        help="Output file path"
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Limit number of tools (for testing)"
+    )
+
+    args = parser.parse_args()
+
+    corpus_path = Path(args.corpus)
+    toollens_path = Path(args.toollens_data)
+    output_path = Path(args.output)
+
+    if not corpus_path.exists():
+        print(f"Error: corpus not found at {corpus_path}")
+        print("Download with: wget https://huggingface.co/datasets/Tool-COLT/ToolLens/resolve/main/corpus.jsonl")
+        sys.exit(1)
+
+    # Load data
+    print("Loading corpus...")
+    tools = load_toollens_corpus(corpus_path)
+    print(f"Loaded {len(tools)} tools")
+
+    if args.limit:
+        tools = tools[:args.limit]
+        print(f"Limited to {len(tools)} tools")
+
+    # Load examples
+    examples = {}
+    if toollens_path.exists():
+        print("Loading example usages...")
+        examples = load_example_usages(toollens_path)
+        print(f"Loaded examples for {len(examples)} tools")
+    else:
+        print(f"Warning: ToolLens data not found at {toollens_path}, skipping examples")
+
+    # Enhance tools
+    print("\nEnhancing tools...")
+    enhanced_tools = []
+    for i, tool in enumerate(tools, 1):
+        if i % 50 == 0:
+            print(f"  Processed {i}/{len(tools)}")
+        enhanced = enhance_tool(tool, examples)
+        enhanced_tools.append(enhanced)
+
+    # Save
+    print(f"\nSaving {len(enhanced_tools)} tools to {output_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w') as f:
+        for tool in enhanced_tools:
+            f.write(json.dumps(tool, ensure_ascii=False) + '\n')
+
+    # Summary statistics
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    # Count by category
+    categories = defaultdict(int)
+    for tool in enhanced_tools:
+        categories[tool['category']] += 1
+
+    print("\nTools by category:")
+    for cat, count in sorted(categories.items(), key=lambda x: x[1], reverse=True):
+        print(f"  {cat:30s}: {count:3d}")
+
+    # Count with return_schema
+    with_schema = sum(1 for t in enhanced_tools if t.get('has_return_schema', False))
+    print(f"\nWith return_schema: {with_schema}/{len(enhanced_tools)}")
+
+    # Count with examples
+    with_examples = sum(1 for t in enhanced_tools if t.get('example_queries'))
+    print(f"With example queries: {with_examples}/{len(enhanced_tools)}")
+
+    print("\n" + "=" * 60)
+    print(f"Output saved to: {output_path}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
