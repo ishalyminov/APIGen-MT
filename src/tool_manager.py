@@ -11,6 +11,7 @@ from collections import defaultdict
 
 from llm_client import LLMClient
 from config_pool import generate_random_config, MESSAGE_CONFIGS
+
 import random
 
 
@@ -634,7 +635,7 @@ class ToolManager:
     Manages a pool of tools that can be loaded from a file or defined in code.
     
     Supports loading tools from:
-    1. A JSON/JSONL file containing BFCL-style tool definitions
+        1. A JSON/JSONL file containing tool definitions
     2. Python functions with type hints and docstrings
     """
     
@@ -655,12 +656,12 @@ class ToolManager:
             If provided, tools will be loaded from this file.
             tools: Optional list of Python functions to use as tools.
             If both tool_pool_path and tools are provided, they will be merged.
-            invocation_examples_path: Path to bfcl_v3_invocation_examples.jsonl.
+            invocation_examples_path: Path to invocation examples JSONL.
             If provided, Python tool implementations will be loaded and used
             for actual execution instead of LLM simulation.
             use_config_pool: If True, reset_python_tool_instances() picks a random
             config from the config pool for diverse starting states. If False,
-            falls back to the single FULL_INITIAL_CONFIGS.
+            falls back to the original single FULL_INITIAL_CONFIGS.
         """
         self.llm = llm
         self.use_config_pool = use_config_pool
@@ -673,6 +674,8 @@ class ToolManager:
         self.api_name_to_class_key: Dict[str, str] = {}
         # Canonical initial configs for resetting instances
         self._canonical_configs: Dict[str, Dict[str, Any]] = {}
+        # Cached config for in-datapoint consistency
+        self._cached_initial_config: Optional[Dict[str, Dict[str, Any]]] = None
 
         # Load tools from file if path is provided
         if tool_pool_path:
@@ -691,14 +694,14 @@ class ToolManager:
             self.load_python_tool_implementations(invocation_examples_path)
 
     def load_python_tool_implementations(self, invocation_examples_path: str) -> None:
-        """Load Python tool implementations from invocation examples.
+        """Load core Python tool implementations from invocation examples.
 
-        This creates instances of all 8 tool classes and builds the
+        This creates instances of the built-in tool classes and builds the
         api_name -> class_key mapping so that invoke_tool can call
         actual Python code instead of LLM simulation.
 
         Args:
-            invocation_examples_path: Path to bfcl_v3_invocation_examples.jsonl
+            invocation_examples_path: Path to the invocation examples JSONL
         """
         path_obj = Path(invocation_examples_path)
         if not path_obj.exists():
@@ -721,17 +724,14 @@ class ToolManager:
 
         # Build api_name -> class_key mapping from loaded tool schemas
         for tool in self.tool_schemas:
-            # The 'name' field in tool_schema is the api_name
-            # We need to find the class_key. We can match by looking at
-            # the original BFCL data stored in tool_implementations
             pass
 
-        # Build the mapping from the BFCL definitions we already loaded
+        # Build the mapping from tool definitions we already loaded
         self.api_name_to_class_key = {}
         for tool_name, impl_info in self.tool_implementations.items():
-            if impl_info.get("type") == "bfcl":
-                bfcl_data = impl_info.get("data", {})
-                class_key = bfcl_data.get("tool_name", "")
+            if impl_info.get("type") == "schema":
+                data = impl_info.get("data", {})
+                class_key = data.get("tool_name", "")
                 if class_key:
                     self.api_name_to_class_key[tool_name] = class_key
 
@@ -887,6 +887,21 @@ class ToolManager:
         except Exception as e:
             return {"error": str(e)}
 
+    def register_tool_implementations(
+        self,
+        api_name_map: Dict[str, str],
+        instances: Dict[str, Any],
+    ) -> None:
+        """Register Python tool implementations for actual tool execution.
+
+        Args:
+            api_name_map: Mapping from api_name -> class_key for the tools.
+            instances: Mapping from class_key -> instantiated tool object.
+        """
+        self.api_name_to_class_key.update(api_name_map)
+        self.python_tool_instances.update(instances)
+        print(f"Registered {len(instances)} tool classes with {len(api_name_map)} api_name mappings")
+
     @staticmethod
     def _coerce_params(method: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         """Coerce parameter types to match the method signature.
@@ -978,11 +993,11 @@ class ToolManager:
                         print(f"Warning: Skipping invalid JSON line: {line[:50]}... Error: {e}")
         
         for tool_data in tools_data:
-            self._add_tool_from_bfcl_definition(tool_data)
-    
-    def _add_tool_from_bfcl_definition(self, tool_data: Dict[str, Any]) -> None:
+            self._add_tool_definition(tool_data)
+
+    def _add_tool_definition(self, tool_data: Dict[str, Any]) -> None:
         """
-        Add a tool from BFCL-style definition.
+        Add a tool definition to the schema pool.
         
         Args:
             tool_data: Dictionary containing tool definition
@@ -1055,7 +1070,7 @@ class ToolManager:
         
         # Store implementation info for virtual execution
         self.tool_implementations[tool_name] = {
-            "type": "bfcl",
+            "type": "schema",
             "data": tool_data
         }
     
@@ -1227,7 +1242,7 @@ class ToolManager:
                 except Exception as e:
                     return {"error": str(e)}
 
-        # Use virtual tool executor for BFCL-style tools or when no implementation exists
+        # Fall back to LLM-based simulation when no Python implementation exists
         return self.__virtual_tool_executor(tool_name, params, schema=tool_schema)
     
     def __virtual_tool_executor(
@@ -1658,7 +1673,7 @@ DEFAULT_TOOLS = [
 
 
 if __name__ == "__main__":
-    # Example: Load tools from BFCL tool pool file with Python implementations
+    # Example: Load tools from tool pool file with Python implementations
     project_root = os.path.join(os.path.dirname(__file__), "..", "..")
     tool_pool_path = os.path.join(
         project_root,

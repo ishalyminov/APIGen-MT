@@ -1,164 +1,97 @@
 """
-LLM-based predictor for tool output type and description.
-Uses LLM-as-a-judge to predict what a tool returns based on its schema and invocation contexts.
+LLM-based schema predictor for tool extraction.
+
+Provides unified schema prediction for both BFCL and ToolLens datasets.
 """
 
 import json
 import os
-import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Any, Optional
 from pydantic import BaseModel
-from openai import OpenAI
 
-# Add src directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from llm_client import LLMClient, LocalOpenAILLMClient
+from llm_client import LocalOpenAILLMClient
 
 
 class OutputPrediction(BaseModel):
     """Schema for LLM output prediction"""
-    output_type: str
-    output_description: str
+    output_type: str = "unknown"
+    output_description: str = ""
+    return_schema: Optional[Dict[str, Any]] = None
 
 
-class LLMOutputPredictor:
+class SchemaPredictor:
     """
-    Uses LLM to predict output type and description for tools based on:
-    - Tool schema (name, description, parameters)
-    - Invocation contexts (how the tool is used in practice)
+    Unified LLM-based schema predictor for both BFCL and ToolLens tools.
 
-    Note: This class only supports NVIDIA LLM client.
+    Supports two modes:
+    - "bfcl": Returns output_type and output_description (for BFCL-style tools)
+    - "toollens": Returns return_schema dict mapping field names to types (for ToolLens-style tools)
+
+    Uses LocalOpenAILLMClient which is the standard LLM client for this codebase.
     """
 
-    def __init__(self, client_type: str = "nvidia", debug: bool = False):
+    def __init__(self, model: str = "minimax/minimax-m2.7", debug: bool = False,
+                 api_key: str = None, api_base: str = None):
         """
-        Initialize the LLM output predictor.
+        Initialize the schema predictor.
 
         Args:
-            client_type: Type of LLM client (must be 'nvidia', others are deprecated)
+            model: Model name for LocalOpenAILLMClient
             debug: Enable debug logging
-
-        Note: client_type parameter is kept for backward compatibility but only 'nvidia' is supported.
+            api_key: Optional API key (falls back to OPENAI_API_KEY env var)
+            api_base: Optional API base URL (falls back to OPENAI_API_BASE env var)
         """
         self.debug = debug
 
-        # Only NVIDIA client is supported
-        if client_type != "nvidia":
-            print(f"⚠️ Warning: client_type '{client_type}' is deprecated. Using 'nvidia' instead.")
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        api_base = api_base or os.getenv("OPENAI_API_BASE")
 
-        # Use OpenAI-compatible client with NVIDIA API
-        api_key = os.getenv("OPENAI_API_KEY")
-        base_url = os.getenv("OPENAI_API_BASE", "https://integrate.api.nvidia.com/v1")
+        if not api_key or not api_base:
+            raise ValueError("OPENAI_API_KEY and OPENAI_API_BASE must be set")
 
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment")
-
-        self.client = OpenAI(
+        self.llm = LocalOpenAILLMClient(
+            url=api_base,
             api_key=api_key,
-            base_url=base_url
+            api_model=model,
+            hf_tokenizer_id=None
         )
-        self.model = "z-ai/glm-5.1"
-        self.client_type = "nvidia"
+        self.model = model
 
-    def predict_output(
+    def _safe_generate(self, messages: list, max_retries: int = 3, max_tokens: int = 800) -> str:
+        """Call LLM with retries."""
+        import random as _rng
+        for attempt in range(max_retries):
+            try:
+                result = self.llm.generate(messages, temperature=0.7, max_tokens=max_tokens)
+                if result and result.strip():
+                    return result
+                raise ValueError("Empty response")
+            except Exception as e:
+                delay = min(2 * (2 ** attempt), 30) + _rng.uniform(0, 1)
+                print(f"    LLM attempt {attempt + 1} failed: {e}, retrying in {delay:.1f}s...")
+                time.sleep(delay)
+        return "{}"
+
+    def predict_for_bfcl(
         self,
         tool_schema: Dict[str, Any],
         invocation_contexts: List[Dict[str, Any]],
         max_contexts: int = 5,
-        max_retries: int = 3
     ) -> OutputPrediction:
         """
-        Predict output type and description for a tool.
+        Predict output_type and output_description (BFCL style).
 
         Args:
             tool_schema: Tool definition schema
-            invocation_contexts: List of invocation contexts
+            invocation_contexts: List of invocation contexts with user_message, assistant_message, tool_calls
             max_contexts: Maximum number of contexts to include
-            max_retries: Maximum number of retry attempts on LLM failure (default: 3)
 
         Returns:
             OutputPrediction with output_type and output_description
         """
-        # Build the prompt
-        system_prompt = self._get_system_prompt()
-        prompt = self._build_prompt(tool_schema, invocation_contexts[:max_contexts])
-
-        if self.debug:
-            print(f"\n{'='*80}")
-            print(f"Predicting output for: {tool_schema.get('api_name', 'unknown')}")
-            print(f"{'='*80}")
-            print(f"System prompt:\n{system_prompt}")
-            print(f"\nUser prompt:\n{prompt}")
-            print(f"{'='*80}\n")
-
-        # Retry loop
-        for attempt in range(1, max_retries + 1):
-            try:
-                if self.client_type == "nvidia":
-                    # Use OpenAI client directly
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=[
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": prompt}
-                        ],
-                        temperature=0.7,
-                        max_tokens=500
-                    )
-
-                    content = response.choices[0].message.content
-
-                    if self.debug:
-                        print(f"LLM Response (attempt {attempt}): {content}")
-
-                    # Parse JSON from response
-                    # Try to extract JSON from the response
-                    import re
-                    json_match = re.search(r'\{[^{}]*"output_type"[^{}]*"output_description"[^{}]*\}', content, re.DOTALL)
-                    if json_match:
-                        prediction_dict = json.loads(json_match.group())
-                    else:
-                        # Try parsing the whole response
-                        prediction_dict = json.loads(content)
-
-                    # Add 5-second timeout after successful LLM call
-                    time.sleep(5)
-                    return OutputPrediction(**prediction_dict)
-                else:
-                    # Use existing LLM client
-                    prediction, reasoning = self.llm.json_output(
-                        prompt=prompt,
-                        system_prompt=system_prompt,
-                        schema=OutputPrediction,
-                        reasoning=True
-                    )
-
-                    if self.debug:
-                        print(f"Reasoning: {reasoning}")
-                        print(f"Prediction: {prediction}")
-
-                    # Add 5-second timeout after successful LLM call
-                    time.sleep(5)
-                    return OutputPrediction(**prediction)
-
-            except Exception as e:
-                if attempt < max_retries:
-                    print(f"Attempt {attempt}/{max_retries} failed for {tool_schema.get('api_name', 'unknown')}: {e}")
-                    print(f"Retrying...")
-                else:
-                    print(f"Error predicting output after {max_retries} attempts: {e}")
-                    # Return default values
-                    return OutputPrediction(
-                        output_type="unknown",
-                        output_description="Failed to predict output description"
-                    )
-
-    def _get_system_prompt(self) -> str:
-        """Get the system prompt for the LLM"""
-        return """You are an expert at analyzing function/tool schemas and predicting what they return.
+        system_prompt = """You are an expert at analyzing function/tool schemas and predicting what they return.
 
 Given information about a function/tool:
 1. Its name and description
@@ -180,101 +113,209 @@ Respond ONLY with a valid JSON object matching the schema:
 {
   "output_type": "string",
   "output_description": "string"
-}"""
+}}"""
 
-    def _build_prompt(
-        self,
-        tool_schema: Dict[str, Any],
-        invocation_contexts: List[Dict[str, Any]]
-    ) -> str:
-        """Build the prompt for the LLM"""
-
-        # Extract tool information
+        # Build prompt
         tool_name = tool_schema.get('tool_name', 'unknown')
         api_name = tool_schema.get('api_name', 'unknown')
         api_description = tool_schema.get('api_description', 'No description available')
         parameters = tool_schema.get('parameters', {})
 
-        # Build the prompt
         prompt_parts = [
-            f"# Function Information",
-            f"",
+            f"# Function Information\n",
             f"**Tool Name**: {tool_name}",
             f"**API Name**: {api_name}",
             f"**Description**: {api_description}",
             f"",
         ]
 
-        # Add parameters
         if parameters:
-            prompt_parts.append("## Parameters")
-            prompt_parts.append("")
-            prompt_parts.append(f"```json")
-            # Convert to dict if it's a Pydantic model or has to_dict method
+            prompt_parts.append("## Parameters\n")
+            props = parameters.get('properties', {})
             if hasattr(parameters, 'to_dict'):
                 parameters = parameters.to_dict()
-            elif hasattr(parameters, 'model_dump'):
-                parameters = parameters.model_dump()
-            prompt_parts.append(json.dumps(parameters, indent=2))
-            prompt_parts.append(f"```")
-            prompt_parts.append("")
+            prompt_parts.append(f"```json\n{json.dumps(parameters, indent=2)}\n```\n")
 
-        # Add invocation contexts
+        # Include output schema if available (for ToolLens tools)
+        output_schema = tool_schema.get('output_schema', {})
+        if output_schema and output_schema.get('properties'):
+            prompt_parts.append("## Expected Output Schema\n")
+            prompt_parts.append(f"```json\n{json.dumps(output_schema, indent=2)}\n```\n")
+
         if invocation_contexts:
-            prompt_parts.append("## Example Invocations")
-            prompt_parts.append("")
-
-            for i, ctx in enumerate(invocation_contexts, 1):
+            prompt_parts.append("## Example Invocations\n")
+            for i, ctx in enumerate(invocation_contexts[:max_contexts], 1):
                 user_message = ctx.get('user_message', 'N/A')
                 assistant_message = ctx.get('assistant_message', 'N/A')
                 tool_calls = ctx.get('tool_calls', [])
 
-                prompt_parts.append(f"### Context {i}")
-                prompt_parts.append(f"**User**: {user_message}")
-                prompt_parts.append(f"**Assistant**: {assistant_message}")
+                prompt_parts.append(f"### Context {i}\n")
+                prompt_parts.append(f"**User**: {user_message}\n")
+                prompt_parts.append(f"**Assistant**: {assistant_message}\n")
 
                 if tool_calls:
-                    prompt_parts.append(f"**Tool Calls**:")
+                    prompt_parts.append("**Tool Calls**:\n")
                     for tc in tool_calls:
-                        prompt_parts.append(f"- {tc.get('name', 'unknown')}: {json.dumps(tc.get('arguments', {}))}")
+                        prompt_parts.append(f"- {tc.get('name', 'unknown')}: {json.dumps(tc.get('arguments', {}))}\n")
 
                 prompt_parts.append("")
 
-        # Add the task
         prompt_parts.extend([
-            "## Task",
-            f"",
-            f"Based on the function information and example invocations above, predict:",
-            f"1. The output type this function returns",
-            f"2. A clear description of what the output contains",
-            f"",
-            f"Respond with a JSON object containing 'output_type' and 'output_description'.",
+            "## Task\n",
+            "Based on the function information and example invocations above, predict:\n",
+            "1. The output type this function returns\n",
+            "2. A clear description of what the output contains\n",
+            "\nRespond with a JSON object containing 'output_type' and 'output_description'.",
         ])
 
-        return "\n".join(prompt_parts)
+        prompt = "\n".join(prompt_parts)
 
+        if self.debug:
+            print(f"\nPredicting for {api_name}")
+
+        try:
+            response = self._safe_generate([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt}
+            ])
+
+            # Parse JSON
+            response = response.strip()
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                response = response[start:end]
+
+            pred_dict = json.loads(response)
+            return OutputPrediction(
+                output_type=pred_dict.get('output_type', 'unknown'),
+                output_description=pred_dict.get('output_description', ''),
+                return_schema=None
+            )
+
+        except Exception as e:
+            print(f"    Warning: Failed to parse prediction: {e}")
+            return OutputPrediction(output_type="unknown", output_description="Failed to predict")
+
+    def predict_for_toollens(
+        self,
+        api_name: str,
+        api_description: str,
+        parameters: Dict[str, Any],
+        example_queries: List[str],
+        max_examples: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Predict return_schema (ToolLens style).
+
+        Returns a dict mapping field names to types, e.g., {"success": "bool", "message": "str"}.
+
+        Args:
+            api_name: The API function name
+            api_description: What the API does
+            parameters: Parameter schema
+            example_queries: Example user queries showing how the API is used
+            max_examples: Max examples to include
+
+        Returns:
+            Dict mapping field names to type strings
+        """
+        system_prompt = """You are an expert at API documentation analysis.
+
+Given an API's name, description, parameters, and example queries, predict what the API returns.
+
+Respond ONLY with a valid JSON object representing the return schema.
+Use format: {"field_name": "type", ...} where type is one of:
+- "str" for strings
+- "int" for integers
+- "float" for decimal numbers
+- "bool" for booleans
+- "dict" for objects
+- "list" for arrays
+
+If the API returns nothing meaningful, return {}.
+
+Examples:
+- "Get user info" + params {user_id} -> {"user_id": "str", "name": "str", "email": "str"}
+- "Search products" + params {query} -> {"results": [{"name": "str", "price": "float"}]}
+- "Delete item" + params {id} -> {"success": "bool", "message": "str"}
+- "Get random fact" + params {type} -> {"fact": "str", "type": "str"}
+- "Airport data" + params {} -> {"airports": [{"name": "str", "code": "str", "city": "str"}]}"""
+
+        params_str = json.dumps(parameters.get('properties', {}), indent=2)
+        examples_str = "\n".join([f"- {q}" for q in example_queries[:max_examples]])
+
+        user_prompt = f"""API Name: {api_name}
+Description: {api_description}
+Parameters:
+{params_str}
+
+Example User Queries (how this API is used):
+{examples_str}
+
+What does this API return? Respond with JSON schema only."""
+
+        if self.debug:
+            print(f"\nPredicting schema for {api_name}")
+
+        try:
+            response = self._safe_generate([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ], max_tokens=600)
+
+            # Parse JSON
+            response = response.strip()
+            if "```json" in response:
+                response = response.split("```json")[1].split("```")[0]
+            elif "```" in response:
+                response = response.split("```")[1].split("```")[0]
+
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            if start >= 0 and end > start:
+                response = response[start:end]
+
+            return json.loads(response)
+
+        except Exception as e:
+            print(f"    Warning: Failed to predict schema: {e}")
+            return {}
+
+    # Backwards compatibility alias
+    def predict_output(self, tool_schema: Dict[str, Any], invocation_contexts: List[Dict[str, Any]], max_contexts: int = 5) -> OutputPrediction:
+        """Alias for predict_for_bfcl (backwards compatibility)."""
+        return self.predict_for_bfcl(tool_schema, invocation_contexts, max_contexts)
+
+
+# ─── Convenience functions ────────────────────────────────────────────────────
 
 def predict_outputs_for_tools(
     tools: List[Dict[str, Any]],
     invocations: List[Dict[str, Any]],
-    client_type: str = "nvidia",
+    model: str = "minimax/minimax-m2.7",
     max_contexts: int = 5,
     debug: bool = False
 ) -> List[Dict[str, Any]]:
     """
-    Predict output types and descriptions for multiple tools.
+    Predict output types and descriptions for multiple tools (BFCL style).
 
     Args:
         tools: List of tool definitions
         invocations: List of all invocation examples
-        client_type: Type of LLM client to use (must be 'nvidia')
+        model: LLM model to use
         max_contexts: Maximum invocation contexts per tool
         debug: Enable debug mode
 
     Returns:
         List of tool definitions with added output_type and output_description
     """
-    predictor = LLMOutputPredictor(client_type=client_type, debug=debug)
+    predictor = SchemaPredictor(model=model, debug=debug)
 
     # Index invocations by tool name
     invocations_by_tool = {}
@@ -303,7 +344,7 @@ def predict_outputs_for_tools(
         tool_invocations = invocations_by_tool.get(tool_name, [])
 
         # Predict output
-        prediction = predictor.predict_output(tool, tool_invocations, max_contexts)
+        prediction = predictor.predict_for_bfcl(tool, tool_invocations, max_contexts)
 
         # Create enhanced tool definition
         enhanced_tool = {
@@ -317,11 +358,71 @@ def predict_outputs_for_tools(
     return enhanced_tools
 
 
+def predict_toollens_schemas(
+    tools: List[Dict[str, Any]],
+    examples: Dict[str, List[str]],
+    model: str = "minimax/minimax-m2.7",
+    debug: bool = False
+) -> List[Dict[str, Any]]:
+    """
+    Predict return schemas for ToolLens tools.
+
+    Args:
+        tools: List of tool definitions
+        examples: Dict mapping api_name to list of example queries
+        model: LLM model to use
+        debug: Enable debug mode
+
+    Returns:
+        List of tool definitions with added return_schema
+    """
+    predictor = SchemaPredictor(model=model, debug=debug)
+
+    enhanced_tools = []
+
+    print(f"\n{'='*80}")
+    print("🤖 PREDICTING TOOLLENS SCHEMAS USING LLM")
+    print(f"{'='*80}")
+    print()
+
+    for i, tool in enumerate(tools, 1):
+        api_name = tool.get('api_name', 'unknown')
+
+        print(f"Processing tool {i}/{len(tools)}: {api_name}")
+
+        # Get example queries for this tool
+        tool_examples = examples.get(api_name, [])
+
+        # Predict schema
+        return_schema = predictor.predict_for_toollens(
+            api_name=api_name,
+            api_description=tool.get('api_description', ''),
+            parameters=tool.get('parameters', {}),
+            example_queries=tool_examples
+        )
+
+        # Create enhanced tool definition
+        enhanced_tool = {
+            **tool,
+            'return_schema': return_schema
+        }
+
+        enhanced_tools.append(enhanced_tool)
+
+    return enhanced_tools
+
+
+# ─── Backwards compatibility aliases ─────────────────────────────────────────
+
+# Keep old class name as alias
+LLMOutputPredictor = SchemaPredictor
+
+
 if __name__ == "__main__":
-    # Test the predictor
     from dotenv import load_dotenv
     load_dotenv()
 
+    # Test the predictor
     test_tool = {
         "tool_name": "weather_api",
         "api_name": "get_weather",
@@ -351,11 +452,22 @@ if __name__ == "__main__":
         }
     ]
 
-    predictor = LLMOutputPredictor(client_type="nvidia", debug=True)
-    prediction = predictor.predict_output(test_tool, test_contexts)
+    predictor = SchemaPredictor(debug=True)
+    prediction = predictor.predict_for_bfcl(test_tool, test_contexts)
 
     print(f"\n{'='*80}")
-    print("PREDICTION RESULT")
+    print("BFCL PREDICTION RESULT")
     print(f"{'='*80}")
     print(f"Output Type: {prediction.output_type}")
     print(f"Output Description: {prediction.output_description}")
+
+    print(f"\n{'='*80}")
+    print("TOOLLENS SCHEMA PREDICTION")
+    print(f"{'='*80}")
+    schema = predictor.predict_for_toollens(
+        api_name="Airport data",
+        api_description="API returns a file with a list of airports from the database",
+        parameters={"type": "object", "properties": {}},
+        example_queries=["Show me airports in California", "List all airports"]
+    )
+    print(f"Return Schema: {schema}")

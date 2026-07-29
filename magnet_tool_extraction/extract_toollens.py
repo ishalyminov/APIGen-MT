@@ -19,7 +19,7 @@ from collections import defaultdict
 import os
 from dotenv import load_dotenv
 
-from llm_client import LocalOpenAILLMClient
+from llm_output_predictor import SchemaPredictor
 
 # Type normalization from ToolLens informal types to JSON Schema types
 TYPE_MAPPING = {
@@ -219,96 +219,6 @@ def get_output_type(return_schema: Dict) -> str:
         return 'mixed'
 
 
-class SchemaPredictor:
-    """Use LLM to predict return schemas for tools that don't have them."""
-
-    def __init__(self, llm_client: LocalOpenAILLMClient):
-        self.llm = llm_client
-
-    def _safe_generate(self, messages: list, max_retries: int = 3) -> str:
-        """Call LLM with retries."""
-        import random as _rng
-        for attempt in range(max_retries):
-            try:
-                result = self.llm.generate(messages, temperature=0.7, max_tokens=800)
-                if result and result.strip():
-                    return result
-            except Exception as e:
-                delay = min(2 * (2 ** attempt), 30) + _rng.uniform(0, 1)
-                print(f"    LLM attempt {attempt + 1} failed: {e}, retrying in {delay:.1f}s...")
-                time.sleep(delay)
-        return "{}"
-
-    def predict_schema(
-        self,
-        api_name: str,
-        api_description: str,
-        parameters: Dict,
-        example_queries: List[str],
-        max_examples: int = 3
-    ) -> Dict[str, Any]:
-        """Predict return schema for a tool using LLM."""
-
-        system_prompt = """You are an expert at API documentation analysis.
-
-Given an API's name, description, parameters, and example queries, predict what the API returns.
-
-Respond ONLY with a valid JSON object representing the return schema.
-Use format: {"field_name": "type", ...} where type is one of:
-- "str" for strings
-- "int" for integers
-- "float" for decimal numbers
-- "bool" for booleans
-- "dict" for objects
-- "list" for arrays
-
-If the API returns nothing meaningful, return {}.
-
-Examples:
-- "Get user info" + params {user_id} -> {"user_id": "str", "name": "str", "email": "str"}
-- "Search products" + params {query} -> {"results": [{"name": "str", "price": "float"}]}
-- "Delete item" + params {id} -> {"success": "bool", "message": "str"}
-"""
-
-        params_str = json.dumps(parameters.get('properties', {}), indent=2)
-        examples_str = "\n".join([f"- {q}" for q in example_queries[:max_examples]])
-
-        user_prompt = f"""API Name: {api_name}
-Description: {api_description}
-Parameters:
-{params_str}
-
-Example User Queries (how this API is used):
-{examples_str}
-
-What does this API return? Respond with JSON schema only."""
-
-        try:
-            response = self._safe_generate([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ])
-
-            # Parse JSON response
-            response = response.strip()
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-
-            start = response.find("{")
-            end = response.rfind("}") + 1
-            if start >= 0 and end > start:
-                response = response[start:end]
-
-            schema = json.loads(response)
-            return schema if schema else {}
-
-        except (json.JSONDecodeError, Exception) as e:
-            print(f"    Warning: Failed to parse LLM response: {e}")
-            return {}
-
-
 def load_toollens_corpus(corpus_path: Path) -> List[Dict[str, Any]]:
     """Load and parse corpus.jsonl."""
     tools = []
@@ -497,13 +407,7 @@ def main():
         api_base = os.getenv("OPENAI_API_BASE")
         if api_key and api_base:
             print("\nInitializing LLM for schema prediction...")
-            llm_client = LocalOpenAILLMClient(
-                url=api_base,
-                api_key=api_key,
-                api_model=args.model,
-                hf_tokenizer_id=None
-            )
-            predictor = SchemaPredictor(llm_client)
+            predictor = SchemaPredictor(model=args.model, debug=False)
         else:
             print("Warning: OPENAI_API_KEY or OPENAI_API_BASE not set, skipping LLM prediction")
 
@@ -546,7 +450,7 @@ def main():
 
             # Try up to 3 times
             for attempt in range(3):
-                predicted_schema = predictor.predict_schema(
+                predicted_schema = predictor.predict_for_toollens(
                     api_name=api_name,
                     api_description=api_desc,
                     parameters=params,
