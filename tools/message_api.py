@@ -15,10 +15,28 @@ class MessageAPI:
         """Initialize the MessageAPI with the given configuration."""
         self.workspace_id: str = initial_config.get("workspace_id", "")
         self.user_count: int = initial_config.get("user_count", 0)
-        self.user_map: Dict[str, str] = initial_config.get("user_map", {})
-        self.messages_sent_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = initial_config.get("messages_sent_map", {})
-        self.messages_inbox_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = initial_config.get("messages_inbox_map", {})
-        self.message_count: int = initial_config.get("message_count", 0)
+        self.user_map: Dict[str, str] = copy.deepcopy(initial_config.get("user_map", {}))
+        self.messages_sent_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = copy.deepcopy(initial_config.get("messages_sent_map", {}))
+        self.messages_inbox_map: Dict[str, Dict[str, List[Dict[str, Any]]]] = copy.deepcopy(initial_config.get("messages_inbox_map", {}))
+
+        configured_message_count = int(initial_config.get("message_count", 0) or 0)
+        existing_message_ids = []
+        for outer_map in (self.messages_sent_map, self.messages_inbox_map):
+            for peer_map in outer_map.values():
+                if not isinstance(peer_map, dict):
+                    continue
+                for messages in peer_map.values():
+                    if not isinstance(messages, list):
+                        continue
+                    for message in messages:
+                        try:
+                            existing_message_ids.append(int(message.get("message_id")))
+                        except (AttributeError, TypeError, ValueError):
+                            pass
+        self.message_count = max(
+            configured_message_count,
+            max(existing_message_ids, default=0),
+        )
         self.current_user: str = initial_config.get("current_user", "")
 
     def add_contact(self, user_name: str) -> dict:
@@ -173,6 +191,98 @@ class MessageAPI:
         return {
             "login_status": True,
             "message": f"User '{user_id}' logged in successfully."
+        }
+
+    def get_message_stats(self) -> dict:
+        """Return deterministic message statistics for the current user.
+
+        The BFCL contract describes this as a current-user operation.  A
+        logged-out call therefore returns zero counts plus ``logged_in=False``
+        instead of leaking another user's mailbox.
+        """
+        if not self.current_user:
+            return {
+                "logged_in": False,
+                "current_user": "",
+                "sent_count": 0,
+                "received_count": 0,
+                "total_count": 0,
+                "conversation_count": 0,
+            }
+
+        sent_map = self.messages_sent_map.get(self.current_user, {})
+        inbox_map = self.messages_inbox_map.get(self.current_user, {})
+        sent_count = sum(len(messages) for messages in sent_map.values())
+        received_count = sum(len(messages) for messages in inbox_map.values())
+        conversation_count = len(set(sent_map) | set(inbox_map))
+        return {
+            "logged_in": True,
+            "current_user": self.current_user,
+            "sent_count": sent_count,
+            "received_count": received_count,
+            "total_count": sent_count + received_count,
+            "conversation_count": conversation_count,
+        }
+
+    def list_users(self) -> dict:
+        """List all users in the workspace in a stable order."""
+        users = [
+            {"name": name, "user_id": user_id}
+            for name, user_id in sorted(
+                self.user_map.items(),
+                key=lambda item: (item[0].casefold(), item[1]),
+            )
+        ]
+        return {
+            "workspace_id": self.workspace_id,
+            "user_count": len(users),
+            "users": users,
+        }
+
+    def message_get_login_status(self) -> dict:
+        """Return the current Message API authentication state."""
+        return {
+            "logged_in": bool(self.current_user),
+            "current_user": self.current_user,
+        }
+
+    def view_messages_sent(self) -> dict:
+        """Return all messages sent by the current user.
+
+        Messages are flattened and sorted by ID so that simulator replay is
+        deterministic and downstream tools can reference individual results.
+        """
+        if not self.current_user:
+            return {
+                "logged_in": False,
+                "current_user": "",
+                "message_count": 0,
+                "messages": [],
+            }
+
+        messages: List[Dict[str, Any]] = []
+        for receiver_id, sent_messages in self.messages_sent_map.get(
+            self.current_user, {}
+        ).items():
+            for message in sent_messages:
+                if isinstance(message, dict):
+                    messages.append({
+                        "receiver_id": receiver_id,
+                        "message_id": int(message.get("message_id", 0) or 0),
+                        "message": str(message.get("message", "")),
+                    })
+                else:
+                    messages.append({
+                        "receiver_id": receiver_id,
+                        "message_id": 0,
+                        "message": str(message),
+                    })
+        messages.sort(key=lambda item: (item["message_id"], item["receiver_id"]))
+        return {
+            "logged_in": True,
+            "current_user": self.current_user,
+            "message_count": len(messages),
+            "messages": messages,
         }
 
     def search_messages(self, keyword: str) -> dict:

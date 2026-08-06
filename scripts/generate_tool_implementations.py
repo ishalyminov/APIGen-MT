@@ -74,7 +74,7 @@ CLASS_KEY_TO_INITIAL_CONFIG_KEY = {
 
 
 def load_tool_definitions() -> List[Dict[str, Any]]:
-    """Load all 105 tool definitions from bfcl_v3_tools_with_outputs.jsonl."""
+    """Load all 129 stateful BFCL V3 tool definitions from bfcl_v3_tools_with_outputs.jsonl."""
     path = TOOLS_EXTRACTION_DIR / "bfcl_v3_tools_with_outputs.jsonl"
     tools = []
     with open(path) as f:

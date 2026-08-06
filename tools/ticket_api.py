@@ -14,18 +14,28 @@ class TicketAPI:
     def __init__(self, initial_config: dict) -> None:
         """Initialize the TicketAPI with the given configuration, normalizing various config keys."""
         # Normalize ticket queue from various possible keys
-        self.ticket_queue: List[Dict[str, Any]] = initial_config.get(
+        self.ticket_queue: List[Dict[str, Any]] = copy.deepcopy(initial_config.get(
             "tickets_queue",
             initial_config.get(
                 "ticket_list",
                 initial_config.get("support_tickets", initial_config.get("ticket_queue", []))
             )
-        )
+        ))
         
         # Normalize ticket counter from various possible keys
-        self.ticket_counter: int = initial_config.get(
+        configured_ticket_counter = int(initial_config.get(
             "ticket_count",
             initial_config.get("ticket_counter", 0)
+        ) or 0)
+        existing_ticket_ids = []
+        for ticket in self.ticket_queue:
+            try:
+                existing_ticket_ids.append(int(ticket.get("id")))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        self.ticket_counter = max(
+            configured_ticket_counter,
+            max(existing_ticket_ids, default=0),
         )
         
         # Normalize current user
@@ -226,3 +236,21 @@ class TicketAPI:
             self.current_user = username
             return {"success": True}
         return {"success": False}
+
+    def logout(self) -> Dict[str, Any]:
+        """Log out the current ticket-system user."""
+        previous_user = self.current_user
+        was_authenticated = self.authenticated
+        self.authenticated = False
+        self.current_user = ""
+        return {
+            "success": was_authenticated,
+            "username": previous_user if was_authenticated else "",
+        }
+
+    def ticket_get_login_status(self) -> Dict[str, Any]:
+        """Return the currently authenticated ticket-system username."""
+        return {
+            "logged_in": self.authenticated,
+            "username": self.current_user if self.authenticated else "",
+        }

@@ -176,11 +176,9 @@ class GorillaFileSystem:
         except Exception as e:
             return {"error": str(e)}
 
-    def du(self, path: str = ".", human_readable: bool = False) -> Dict[str, Any]:
-        """Calculate disk usage."""
-        target_path = self._get_relative_path(path)
-        if not target_path.exists():
-            return {"error": f"Path '{path}' not found"}
+    def du(self, human_readable: bool = False) -> Dict[str, Any]:
+        """Calculate disk usage of the current working directory."""
+        target_path = Path(self.current_dir)
         
         if target_path.is_file():
             total = target_path.stat().st_size
@@ -225,7 +223,14 @@ class GorillaFileSystem:
         pattern = name if name and name != "None" else ""
         
         for p in search_root.rglob("*"):
-            if pattern and not fnmatch.fnmatch(p.name, pattern):
+            # The public BFCL contract says ``name`` may be contained in the
+            # file name. Preserve glob support while honoring that documented
+            # substring behavior as well.
+            if (
+                pattern
+                and not fnmatch.fnmatch(p.name, pattern)
+                and pattern not in p.name
+            ):
                 continue
             rel = p.relative_to(search_root)
             matches.append(str(rel))
@@ -315,7 +320,12 @@ class GorillaFileSystem:
 
     def pwd(self) -> Dict[str, Any]:
         """Return current working directory."""
-        return {"path": self.current_dir}
+        try:
+            relative = Path(self.current_dir).relative_to(Path(self._temp_dir))
+            virtual_path = "/" if str(relative) == "." else f"/{relative.as_posix()}"
+        except ValueError:
+            virtual_path = "/"
+        return {"path": virtual_path, "current_directory": virtual_path}
 
     def rm(self, file_name: str) -> Dict[str, Any]:
         """Remove file or directory."""
@@ -415,7 +425,7 @@ class GorillaFileSystem:
         
         return {"diff": diff_lines, "identical": len(diff_lines) == 0}
 
-    def sort(self, file_name: str, reverse: bool = False) -> Dict[str, Any]:
+    def sort(self, file_name: str) -> Dict[str, Any]:
         """Sort and return file contents."""
         path = self._get_relative_path(file_name)
         
@@ -425,7 +435,7 @@ class GorillaFileSystem:
             return {"error": f"'{file_name}' is a directory"}
         
         lines = path.read_text().splitlines()
-        sorted_lines = sorted(lines, reverse=reverse)
+        sorted_lines = sorted(lines)
         return {"lines": sorted_lines, "count": len(sorted_lines)}
 
     def get_state(self) -> Dict[str, Any]:

@@ -14,6 +14,40 @@ from config_pool import generate_random_config, MESSAGE_CONFIGS
 import random
 
 
+def _normalise_bfcl_schema_fragment(fragment: Any) -> Any:
+    """Convert BFCL type spellings while preserving all schema constraints.
+
+    The previous loader retained only type/description/default, which silently
+    removed array item schemas, enums, patterns, ranges, and nested properties
+    before prompts were built.
+    """
+    if isinstance(fragment, list):
+        return [_normalise_bfcl_schema_fragment(item) for item in fragment]
+    if not isinstance(fragment, dict):
+        return copy.deepcopy(fragment)
+
+    result = {
+        key: _normalise_bfcl_schema_fragment(value)
+        for key, value in fragment.items()
+    }
+    raw_type = result.get("type")
+    if isinstance(raw_type, str):
+        type_mapping = {
+            "string": "string",
+            "number": "number",
+            "integer": "integer",
+            "float": "number",
+            "boolean": "boolean",
+            "array": "array",
+            "object": "object",
+            "dict": "object",
+            "date": "string",
+            "tuple": "array",
+        }
+        result["type"] = type_mapping.get(raw_type.casefold(), raw_type.casefold())
+    return result
+
+
 CLASS_KEY_TO_INITIAL_CONFIG_KEY = {
     "gorilla_file_system": "GorillaFileSystem",
     "math_api": "MathAPI",
@@ -741,6 +775,9 @@ class ToolManager:
         loaded = len(self.python_tool_instances)
         mapped = len(self.api_name_to_class_key)
         print(f"Loaded {loaded} Python tool classes with {mapped} api_name mappings")
+        # Generation with invocation examples is expected to use real simulator
+        # functions.  Do not silently fall back to an LLM for an exposed tool.
+        self.assert_all_tools_implemented()
 
     def reset_python_tool_instances(self) -> None:
         """Reset all Python tool instances to fresh state.
@@ -857,7 +894,46 @@ class ToolManager:
             True if a Python implementation is available
         """
         class_key = self.api_name_to_class_key.get(tool_name)
-        return class_key is not None and class_key in self.python_tool_instances
+        if class_key is None or class_key not in self.python_tool_instances:
+            return False
+        return callable(getattr(self.python_tool_instances[class_key], tool_name, None))
+
+    def get_missing_python_implementations(self) -> List[Dict[str, str]]:
+        """Return exposed schemas that do not have a callable Python method."""
+        missing: List[Dict[str, str]] = []
+        for schema in self.tool_schemas:
+            tool_name = schema.get("name", "")
+            if not tool_name:
+                continue
+            class_key = self.api_name_to_class_key.get(tool_name, "")
+            instance = self.python_tool_instances.get(class_key)
+            method = getattr(instance, tool_name, None) if instance is not None else None
+            if not callable(method):
+                missing.append({
+                    "tool_name": tool_name,
+                    "class_key": class_key,
+                    "reason": (
+                        "no class mapping"
+                        if not class_key
+                        else "class not instantiated"
+                        if instance is None
+                        else "method not callable"
+                    ),
+                })
+        return missing
+
+    def assert_all_tools_implemented(self) -> None:
+        """Fail fast when an exposed tool cannot be executed locally."""
+        missing = self.get_missing_python_implementations()
+        if missing:
+            rendered = ", ".join(
+                f"{item['tool_name']}[{item['class_key'] or '?'}:{item['reason']}]"
+                for item in missing
+            )
+            raise RuntimeError(
+                "The loaded tool pool contains tools without real Python "
+                f"implementations: {rendered}"
+            )
 
     def invoke_python_tool(self, tool_name: str, params: Dict[str, Any]) -> Any:
         """Invoke a Python tool implementation directly.
@@ -1005,37 +1081,19 @@ class ToolManager:
             "required": required
         }
         
-        # Convert properties
+        # Convert type spellings recursively, but preserve every original
+        # constraint (items, enum, pattern, minimum/maximum, nested properties,
+        # additionalProperties, defaults, and so on).
         for param_name, param_info in properties.items():
             if isinstance(param_info, dict):
-                param_type = param_info.get('type', 'string')
-                # Map types to JSON Schema types
-                type_mapping = {
-                    'STRING': 'string',
-                    'NUMBER': 'number',
-                    'INTEGER': 'integer',
-                    'FLOAT': 'number',
-                    'BOOLEAN': 'boolean',
-                    'ARRAY': 'array',
-                    'OBJECT': 'object',
-                    'DATE': 'string',
-                    'TUPLE': 'array',
-                }
-                json_type = type_mapping.get(param_type.upper(), 'string')
-                
-                param_schema["properties"][param_name] = {
-                    "type": json_type,
-                    "description": param_info.get('description', '')
-                }
-                
-                # Add default if present
-                if 'default' in param_info:
-                    param_schema["properties"][param_name]["default"] = param_info['default']
+                converted = _normalise_bfcl_schema_fragment(param_info)
+                converted.setdefault("type", "string")
+                converted.setdefault("description", "")
+                param_schema["properties"][param_name] = converted
             else:
-                # Simple type definition
                 param_schema["properties"][param_name] = {
                     "type": "string",
-                    "description": ""
+                    "description": "",
                 }
         
         # Create the tool schema with output information

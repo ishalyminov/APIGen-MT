@@ -313,7 +313,7 @@ def test_remove_stock_from_watchlist_not_exists(trading_bot):
 
 def test_remove_stock_from_watchlist_invalid_symbol(trading_bot):
     result = trading_bot.remove_stock_from_watchlist(symbol='INVALID')
-    assert "removed from watchlist" in result.get("status", "")
+    assert "not in watchlist" in result.get("status", "")
 
 
 def test_trading_login_normal(trading_bot):
