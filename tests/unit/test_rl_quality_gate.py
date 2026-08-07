@@ -1,3 +1,5 @@
+import pytest
+
 from rl_quality_gate import validate_transition_quality
 
 
@@ -102,4 +104,19 @@ def test_terminal_echo_is_not_rejected_as_a_noop_mutation():
         post_state={"gorilla_file_system": {"current_dir": "/"}},
         tool_arguments={"content": "hello"},
     )
+    assert result["passed"] is True
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    ["logout", "trading_logout", "releaseBrakePedal", "update_market_status"],
+)
+def test_session_and_control_updates_are_treated_as_mutations(tool_name):
+    result = validate_transition_quality(
+        tool_name=tool_name,
+        tool_output={"success": True},
+        pre_state={"api": {"value": "before"}},
+        post_state={"api": {"value": "after"}},
+    )
+
     assert result["passed"] is True

@@ -91,8 +91,6 @@ class MessageAPI:
 
     def delete_message(self, receiver_id: str, message_id: Optional[int] = None) -> dict:
         """Delete a message sent to a receiver by its message_id."""
-        msg_id_int = int(message_id) if message_id is not None else 0
-
         if not self.current_user:
             return {
                 "deleted_status": False,
@@ -126,12 +124,36 @@ class MessageAPI:
                 "message": "No messages found to delete."
             }
 
-        # Find the message dict with matching message_id
+        # ``message_id`` is optional in the BFCL contract: omitting it means
+        # "delete the latest message to this receiver".  The previous
+        # implementation searched for ID 0, making every such valid call fail.
+        # Legacy configs may also contain bare message strings rather than the
+        # newer structured records, so keep deletion deterministic for both.
         found_idx = None
-        for idx, msg_dict in enumerate(sent_messages):
-            if msg_dict.get("message_id") == msg_id_int:
-                found_idx = idx
-                break
+        if message_id is None:
+            found_idx = len(sent_messages) - 1
+            latest = sent_messages[found_idx]
+            msg_id_int = (
+                int(latest.get("message_id", found_idx + 1))
+                if isinstance(latest, dict)
+                else found_idx + 1
+            )
+        else:
+            try:
+                msg_id_int = int(message_id)
+            except (TypeError, ValueError):
+                return {
+                    "deleted_status": False,
+                    "message_id": "0",
+                    "message": f"Invalid message ID {message_id}.",
+                }
+            for idx, message_record in enumerate(sent_messages):
+                if (
+                    isinstance(message_record, dict)
+                    and message_record.get("message_id") == msg_id_int
+                ):
+                    found_idx = idx
+                    break
 
         if found_idx is None:
             return {
@@ -140,13 +162,21 @@ class MessageAPI:
                 "message": f"Message with ID {message_id} not found."
             }
 
-        sent_messages.pop(found_idx)
+        removed_message = sent_messages.pop(found_idx)
 
         # Remove the corresponding message from the receiver's inbox
         if receiver_id in self.messages_inbox_map and sender_id in self.messages_inbox_map[receiver_id]:
             inbox_messages = self.messages_inbox_map[receiver_id][sender_id]
-            for idx, msg_dict in enumerate(inbox_messages):
-                if msg_dict.get("message_id") == msg_id_int:
+            for idx, message_record in enumerate(inbox_messages):
+                same_id = (
+                    isinstance(message_record, dict)
+                    and message_record.get("message_id") == msg_id_int
+                )
+                same_legacy_content = (
+                    isinstance(removed_message, str)
+                    and message_record == removed_message
+                )
+                if same_id or same_legacy_content:
                     inbox_messages.pop(idx)
                     break
 
@@ -291,12 +321,12 @@ class MessageAPI:
 
         if not keyword:
             return {
-                "results": "[]"
+                "results": []
             }
 
         if not self.current_user:
             return {
-                "results": "[]"
+                "results": []
             }
 
         sender_id = self.current_user
@@ -326,7 +356,7 @@ class MessageAPI:
                         })
 
         return {
-            "results": json.dumps(results)
+            "results": results
         }
 
     def send_message(self, receiver_id: str, message: str) -> dict:

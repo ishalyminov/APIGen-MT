@@ -338,6 +338,17 @@ def parse_args():
     )
 
     parser.add_argument(
+        '--context-category',
+        action='append',
+        default=[],
+        help=(
+            'Add a companion category to the policy-visible tool context '
+            'while keeping --category as the primary scenario domain. May '
+            'be repeated.'
+        ),
+    )
+
+    parser.add_argument(
         '--model', '-m',
         type=str,
         default='minimax/minimax-m2.7',
@@ -407,6 +418,17 @@ def parse_args():
         help=(
             'Compile one whole turn per LLM call and use deterministic '
             'per-action/state checks (default: enabled).'
+        ),
+    )
+
+    parser.add_argument(
+        '--symbolic-episode-plan',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            'Generate natural user turns and the complete symbolic call graph '
+            'in one Stage-0 request, then execute it deterministically without '
+            'per-turn compiler calls (default: enabled for ordinary multi-turn).'
         ),
     )
 
@@ -1122,6 +1144,33 @@ def run_multi_turn(
     grounding_client=None,
 ):
     """Run multi-turn (multiple user exchanges) generation with checkpoint support."""
+    requested_context_categories = set(
+        str(name) for name in getattr(args, 'context_category', [])
+    )
+    all_tool_schemas = tool_manager.get_tools_json_schema()
+    known_context_categories = {
+        str(tool.get('category', '')) for tool in all_tool_schemas
+    }
+    invalid_context_categories = sorted(
+        requested_context_categories - known_context_categories
+    )
+    if invalid_context_categories:
+        raise ValueError(
+            'Unknown --context-category values: '
+            + ', '.join(invalid_context_categories)
+        )
+    context_allowed_tools = [
+        str(tool.get('name') or tool.get('api_name', ''))
+        for tool in all_tool_schemas
+        if str(tool.get('category', ''))
+        in (requested_context_categories | set(categories))
+        and (tool.get('name') or tool.get('api_name'))
+        # ``add_contact`` was repeatedly invented as a hidden prerequisite for
+        # unrelated cross-domain notifications. Existing recipients are
+        # discoverable through list_users/get_user_id; removing this one
+        # distractor preserves messaging capability and improves state yield.
+        and str(tool.get('name') or tool.get('api_name', '')) != 'add_contact'
+    ]
     required_tools = list(
         dict.fromkeys(str(name) for name in getattr(args, 'required_tool', []))
     )
@@ -1272,6 +1321,35 @@ def run_multi_turn(
     allow_refusal = bool(getattr(args, 'allow_refusal', False))
     allow_parallel = bool(getattr(args, 'allow_parallel', False))
     features_enabled = allow_refusal or allow_parallel
+    symbolic_episode_plan = bool(
+        getattr(args, 'symbolic_episode_plan', True)
+    )
+    if features_enabled and symbolic_episode_plan:
+        # Refusal/parallel scheduling has a separate action-plan contract.  It
+        # remains on V1 until its unordered-group representation is migrated.
+        print(
+            'Symbolic episode plan V2 is currently limited to ordinary '
+            'multi-turn generation; using V1 for refusal/parallel features.'
+        )
+        symbolic_episode_plan = False
+    turnwise_symbolic = bool(
+        symbolic_episode_plan
+        and getattr(args, 'blueprint_actions_per_turn', None)
+        and max(args.blueprint_actions_per_turn) >= max(
+            1,
+            int(os.getenv('APIGEN_SYMBOLIC_TURNWISE_MIN_WIDTH', '5')),
+        )
+        and os.getenv('APIGEN_SYMBOLIC_TURNWISE', '1').strip().casefold()
+        not in {'0', 'false', 'no', 'off'}
+    )
+    # A fresh high-width candidate needs one compiler request per turn plus
+    # query alignment, the episode semantic judge, batched response writer,
+    # and grounding judge.
+    # Never spend the last few row-budget calls on a candidate that cannot
+    # possibly reach an accepted artifact.
+    minimum_calls_to_start_candidate = (
+        int(args.num_turns) + 4 if turnwise_symbolic else 5
+    )
     if features_enabled:
         from refuse_parallel import RefusalParallelMultiTurnGenerator
         generator = RefusalParallelMultiTurnGenerator(
@@ -1306,6 +1384,13 @@ def run_multi_turn(
                 args, 'blueprint_actions_per_turn', None
             ),
             optimized_pipeline=bool(args.optimized_pipeline),
+            symbolic_episode_plan=symbolic_episode_plan,
+            blueprint_min_total_actions=(
+                args.min_total_steps if symbolic_episode_plan else None
+            ),
+            blueprint_max_total_actions=(
+                args.max_total_steps if symbolic_episode_plan else None
+            ),
         )
     else:
         # Keep the exact original class and constructor path when features are
@@ -1317,6 +1402,13 @@ def run_multi_turn(
             actions_per_turn=args.num_actions,
             judge_client=judge_client,
             optimized_pipeline=bool(args.optimized_pipeline),
+            symbolic_episode_plan=symbolic_episode_plan,
+            blueprint_min_total_actions=(
+                args.min_total_steps if symbolic_episode_plan else None
+            ),
+            blueprint_max_total_actions=(
+                args.max_total_steps if symbolic_episode_plan else None
+            ),
             blueprint_max_actions_per_turn=getattr(
                 args, 'blueprint_max_actions_per_turn', None
             ),
@@ -1494,7 +1586,7 @@ def run_multi_turn(
         if (
             candidate_starts_for_row
             >= int(args.max_candidate_starts_per_row)
-            or remaining_row_calls <= 0
+            or remaining_row_calls < minimum_calls_to_start_candidate
             or remaining_row_tokens <= 0
         ):
             print(
@@ -1689,6 +1781,35 @@ def run_multi_turn(
             )
         else:
             focus_category = random.choice(categories)
+        if requested_context_categories:
+            generation_directive = copy.deepcopy(generation_directive or {})
+            generation_directive['allowed_tools'] = list(context_allowed_tools)
+            generation_directive.setdefault(
+                'target_categories',
+                [focus_category, *sorted(requested_context_categories)],
+            )
+            generation_directive.setdefault('target_tools', [])
+            generation_directive.setdefault('hard_required_tools', [])
+            generation_directive.setdefault('context_mode', 'cross_domain')
+            generation_directive.setdefault('motif', 'cross_turn_reference')
+            generation_directive.setdefault(
+                'style_seed', 'natural cross-domain workflow'
+            )
+            generation_directive.setdefault(
+                'scenario_seed', 'coordinate related work across services'
+            )
+            generation_directive.setdefault(
+                'soft_requirements',
+                [
+                    f'Use at least one tool from the primary scenario domain '
+                    f'{focus_category}; the companion domain must not replace '
+                    'the primary workflow.',
+                    'Use the companion domain only where it supports the same '
+                    'realistic user goal; do not add unrelated filler.'
+                ],
+            )
+            generation_directive.setdefault('lesson_ids', [])
+            generation_directive.setdefault('lesson_texts', [])
         if required_tools:
             generation_directive = copy.deepcopy(generation_directive or {})
             generation_directive['hard_required_tools'] = list(required_tools)
@@ -1978,8 +2099,16 @@ def main():
 
     # Initialize judge client if specified, otherwise reuse generator client
     if args.judge_model:
-        judge_api_base = args.judge_api_base or api_base
-        judge_api_key = args.judge_api_key or api_key
+        local_qwen_judge = args.judge_model == QWEN_FINAL_STAGE_MODEL
+        judge_api_base = args.judge_api_base or (
+            os.getenv("LLM_PROXY_URL") if local_qwen_judge else api_base
+        )
+        judge_api_key = args.judge_api_key or (
+            os.getenv("LLM_PROXY_MASTER_KEY") if local_qwen_judge else api_key
+        )
+        if not judge_api_base or not judge_api_key:
+            print("ERROR: missing judge API base/key")
+            sys.exit(1)
         judge_client = LocalOpenAILLMClient(
             url=judge_api_base,
             api_key=judge_api_key,

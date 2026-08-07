@@ -386,6 +386,7 @@ class LocalOpenAILLMClient(LLMClient):
         self.total_attempts = 0
         self.token_usage = TokenUsage()
         self.last_provider = None
+        self.last_finish_reason = None
         self.provider_counts: Dict[str, int] = {}
         self._last_request_finished_at = None
         
@@ -419,6 +420,7 @@ class LocalOpenAILLMClient(LLMClient):
         self.total_attempts = 0
         self.token_usage = TokenUsage()
         self.last_provider = None
+        self.last_finish_reason = None
         self.provider_counts = {}
         self._last_request_finished_at = None
 
@@ -426,6 +428,7 @@ class LocalOpenAILLMClient(LLMClient):
         # Never attribute a failed request to the provider that happened to
         # serve the previous successful request.
         self.last_provider = None
+        self.last_finish_reason = None
         # Count tokens in the prompt before sending to API
         prompt_tokens = self.token_counter.count_prompt_tokens(messages)
 
@@ -558,9 +561,14 @@ class LocalOpenAILLMClient(LLMClient):
                         self.provider_counts.get(self.last_provider, 0) + 1
                     )
 
-                response_text = response_obj["choices"][0]["message"].get("content") or ""
+                choice = response_obj["choices"][0]
+                finish_reason = choice.get("finish_reason")
+                self.last_finish_reason = (
+                    str(finish_reason) if finish_reason is not None else None
+                )
+                response_text = choice["message"].get("content") or ""
                 if not response_text:
-                    response_text = response_obj["choices"][0]["message"].get("reasoning_content") or ""
+                    response_text = choice["message"].get("reasoning_content") or ""
 
                 # Retry empty responses — reasoning models occasionally return blank content
                 if not response_text.strip():

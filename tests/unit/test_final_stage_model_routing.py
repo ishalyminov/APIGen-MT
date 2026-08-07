@@ -236,3 +236,55 @@ def test_local_final_stage_client_omits_openrouter_only_fields(monkeypatch):
     sent_kwargs = local.calls[0][1]
     assert "provider" not in sent_kwargs
     assert "reasoning" not in sent_kwargs
+
+
+def test_purpose_specific_reasoning_override_beats_global(monkeypatch):
+    monkeypatch.setenv("APIGEN_REASONING_EFFORT", "low")
+    monkeypatch.setenv(
+        "APIGEN_BLUEPRINT_SEMANTIC_JUDGE_REASONING_EFFORT", "off"
+    )
+    client = FakeClient("cheap-judge", ["ok"])
+    pipeline = StepByStepGenerator(
+        llm_client=client,
+        judge_client=client,
+        tool_manager=DummyToolManager(),
+        optimized_pipeline=True,
+    )
+
+    result = pipeline._safe_llm_generate(
+        [{"role": "user", "content": "check"}],
+        llm=client,
+        purpose="blueprint_semantic_judge",
+    )
+
+    assert result == "ok"
+    assert client.calls[0][1]["reasoning"] == {
+        "enabled": False,
+        "exclude": True,
+    }
+
+
+def test_purpose_specific_reasoning_token_budget_beats_effort(monkeypatch):
+    monkeypatch.setenv("APIGEN_REASONING_EFFORT", "high")
+    monkeypatch.setenv(
+        "APIGEN_BLUEPRINT_GENERATE_REASONING_MAX_TOKENS", "1024"
+    )
+    client = FakeClient("cheap-teacher", ["ok"])
+    pipeline = StepByStepGenerator(
+        llm_client=client,
+        judge_client=client,
+        tool_manager=DummyToolManager(),
+        optimized_pipeline=True,
+    )
+
+    result = pipeline._safe_llm_generate(
+        [{"role": "user", "content": "plan"}],
+        llm=client,
+        purpose="blueprint_generate",
+    )
+
+    assert result == "ok"
+    assert client.calls[0][1]["reasoning"] == {
+        "max_tokens": 1024,
+        "exclude": True,
+    }

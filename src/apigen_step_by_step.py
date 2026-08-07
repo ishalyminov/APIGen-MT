@@ -289,17 +289,44 @@ class StepByStepGenerator:
         allow_openrouter_extensions = bool(
             getattr(client, "apigen_openrouter_extensions", True)
         )
-        reasoning_effort = os.getenv("APIGEN_REASONING_EFFORT", "").strip().lower()
+        purpose_env_key = (
+            "APIGEN_"
+            + re.sub(r"[^A-Za-z0-9]+", "_", purpose).strip("_").upper()
+            + "_REASONING_EFFORT"
+        )
+        # Cheap writer/judge models often become slower and more verbose when
+        # they inherit the blueprint teacher's reasoning setting.  Allow a
+        # stage-specific override while preserving the historical global
+        # fallback for every existing caller.
+        reasoning_effort = os.getenv(
+            purpose_env_key,
+            os.getenv("APIGEN_REASONING_EFFORT", ""),
+        ).strip().lower()
+        purpose_reasoning_budget_key = purpose_env_key.replace(
+            "_REASONING_EFFORT", "_REASONING_MAX_TOKENS"
+        )
+        reasoning_max_tokens = os.getenv(
+            purpose_reasoning_budget_key,
+            os.getenv("APIGEN_REASONING_MAX_TOKENS", ""),
+        ).strip()
         # Role-specific local clients opt out of OpenRouter-only request fields.
         # Existing generator/judge clients retain their historical behavior.
-        if (
-            allow_openrouter_extensions
-            and reasoning_effort
-            and "reasoning" not in kwargs
-        ):
-            if reasoning_effort in {"off", "none", "disabled", "false", "0"}:
+        if allow_openrouter_extensions and "reasoning" not in kwargs:
+            if reasoning_max_tokens:
+                budget = int(reasoning_max_tokens)
+                if budget < 1:
+                    raise ValueError(
+                        f"{purpose_reasoning_budget_key} must be positive"
+                    )
+                kwargs["reasoning"] = {
+                    "max_tokens": budget,
+                    "exclude": True,
+                }
+            elif reasoning_effort in {
+                "off", "none", "disabled", "false", "0"
+            }:
                 kwargs["reasoning"] = {"enabled": False, "exclude": True}
-            else:
+            elif reasoning_effort:
                 kwargs["reasoning"] = {
                     "effort": reasoning_effort,
                     "exclude": True,
@@ -442,6 +469,7 @@ class StepByStepGenerator:
                 "APIGEN_OPENROUTER_PROVIDER", ""
             ).strip() or None,
             "actual_provider": getattr(client, "last_provider", None),
+            "finish_reason": getattr(client, "last_finish_reason", None),
             "application_attempt": application_attempt,
             "status": status,
             "elapsed_seconds": round(float(elapsed_seconds), 6),
@@ -2377,7 +2405,15 @@ Respond JSON: {"arg1": "value1", ...}
             turn_outputs = compact_turn_outputs
         else:
             turn_outputs = []
-        return {"prior_turn_outputs": turn_outputs}
+        prior_user_queries = execution_context.get("prior_user_queries", [])
+        if not isinstance(prior_user_queries, list):
+            prior_user_queries = []
+        compact = {"prior_turn_outputs": turn_outputs}
+        if prior_user_queries:
+            compact["prior_user_queries"] = copy.deepcopy(
+                prior_user_queries[-12:]
+            )
+        return compact
 
     @staticmethod
     def _resolve_output_path(output: Any, path: str) -> Any:
@@ -2471,6 +2507,14 @@ Respond JSON: {"arg1": "value1", ...}
             haystack = " ".join(visible_text.casefold().split())
             if candidate in haystack:
                 return True
+            # A path such as ``scripts/utils.py`` is deterministically composed
+            # from a visible directory and filename even when the natural user
+            # says "move utils.py into scripts".  Split only path/file syntax;
+            # opaque IDs containing punctuation still require an exact match.
+            if "/" in candidate or "\\" in candidate:
+                path_parts = re.findall(r"[\w@.-]+", candidate)
+                if path_parts and all(part in haystack for part in path_parts):
+                    return True
             # Free-form messages often differ only in surrounding punctuation.
             candidate_tokens = re.findall(r"[\w@./:-]+", candidate)
             return bool(candidate_tokens) and all(
@@ -2497,6 +2541,50 @@ Respond JSON: {"arg1": "value1", ...}
         policy_context: Dict[str, Any],
         call_outputs: Dict[str, Any],
     ) -> Tuple[Any, Dict[str, Any]]:
+        # Structured arguments may bind individual object fields/list items.
+        # This is still fail-closed: every leaf must eventually reach one of
+        # the explicit provenance cases below.
+        if isinstance(spec, dict) and "source" not in spec:
+            schema_type = str(schema.get("type", "")).casefold()
+            properties = schema.get("properties", {})
+            if schema_type not in {"object", "dict"} and not properties:
+                raise ValueError("ARGUMENT_SOURCE_MISSING")
+            values: Dict[str, Any] = {}
+            fields: Dict[str, Any] = {}
+            for name, child_spec in spec.items():
+                child_schema = (
+                    properties.get(name, {})
+                    if isinstance(properties, dict)
+                    else {}
+                )
+                value, provenance = self._materialise_argument_source(
+                    spec=child_spec,
+                    schema=child_schema,
+                    query=query,
+                    policy_context=policy_context,
+                    call_outputs=call_outputs,
+                )
+                values[name] = value
+                fields[name] = provenance
+            return values, {"source": "composite", "fields": fields}
+        if isinstance(spec, list):
+            schema_type = str(schema.get("type", "")).casefold()
+            if schema_type not in {"array", "list"}:
+                raise ValueError("ARGUMENT_SOURCE_MISSING")
+            item_schema = schema.get("items", {})
+            values = []
+            items = []
+            for child_spec in spec:
+                value, provenance = self._materialise_argument_source(
+                    spec=child_spec,
+                    schema=item_schema if isinstance(item_schema, dict) else {},
+                    query=query,
+                    policy_context=policy_context,
+                    call_outputs=call_outputs,
+                )
+                values.append(value)
+                items.append(provenance)
+            return values, {"source": "composite", "items": items}
         if not isinstance(spec, dict) or "source" not in spec:
             raise ValueError("ARGUMENT_SOURCE_MISSING")
         source = str(spec.get("source", "")).strip().casefold()
@@ -2509,11 +2597,32 @@ Respond JSON: {"arg1": "value1", ...}
                 value = self._resolve_output_path(call_outputs[call_id], path)
             except (KeyError, IndexError, TypeError):
                 raise ValueError("TOOL_OUTPUT_PATH_NOT_FOUND")
-            return copy.deepcopy(value), {
+            coercion = None
+            schema_type = str(schema.get("type", "")).casefold()
+            if isinstance(value, str) and schema_type in {
+                "integer", "int", "number", "float",
+            }:
+                numeric_text = value.strip().replace(",", "")
+                if re.fullmatch(
+                    r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?",
+                    numeric_text,
+                ):
+                    numeric_value = float(numeric_text)
+                    if schema_type in {"integer", "int"}:
+                        if numeric_value.is_integer():
+                            value = int(numeric_value)
+                            coercion = "string_to_integer"
+                    else:
+                        value = numeric_value
+                        coercion = "string_to_number"
+            provenance = {
                 "source": "tool_output",
                 "call_id": call_id,
                 "path": path,
             }
+            if coercion:
+                provenance["coercion"] = coercion
+            return copy.deepcopy(value), provenance
         if source in {"user", "history", "visible_context", "literal"}:
             if "value" not in spec:
                 raise ValueError("ARGUMENT_VALUE_MISSING")
@@ -2708,7 +2817,19 @@ Respond only with JSON:
     ) -> Tuple[List[TrajectoryStep], Dict[str, Any]]:
         policy_context = self._compact_policy_context(execution_context)
         trajectory: List[TrajectoryStep] = []
-        call_outputs: Dict[str, Any] = {}
+        # Episode-level symbolic plans use globally unique call IDs and may
+        # bind an argument to a result from an earlier user turn.  Preserve
+        # those outputs separately from the legacy convenience aliases.  The
+        # ordinary turn compiler still uses c1/c2/... and therefore behaves
+        # exactly as before when this map is absent.
+        prior_symbolic_outputs = execution_context.get(
+            "symbolic_call_outputs", {}
+        )
+        call_outputs: Dict[str, Any] = (
+            copy.deepcopy(prior_symbolic_outputs)
+            if isinstance(prior_symbolic_outputs, dict)
+            else {}
+        )
         updated_context = copy.deepcopy(execution_context)
 
         for step_num, compiled in enumerate(compiled_calls, 1):
@@ -2842,6 +2963,9 @@ Respond only with JSON:
                 )
             )
             call_outputs[compiled["call_id"]] = copy.deepcopy(output)
+            updated_context.setdefault("symbolic_call_outputs", {})[
+                compiled["call_id"]
+            ] = copy.deepcopy(output)
             if isinstance(output, dict):
                 for key, value in output.items():
                     updated_context[f"{tool_name}_{key}"] = value

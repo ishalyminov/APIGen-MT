@@ -9,10 +9,12 @@ class QueueLLM:
     def __init__(self, responses, model="test-model"):
         self.responses = list(responses)
         self.calls = 0
+        self.call_kwargs = []
         self.api_model = model
 
     def generate(self, messages, **kwargs):
         self.calls += 1
+        self.call_kwargs.append(kwargs)
         if not self.responses:
             raise AssertionError("unexpected LLM call")
         return self.responses.pop(0)
@@ -186,6 +188,8 @@ def test_all_turn_responses_use_one_writer_and_one_grounding_call():
     assert generator._finalize_deferred_turn_responses(conversation) is True
     assert writer.calls == 1
     assert judge.calls == 1
+    assert writer.call_kwargs[0]["response_format"] == {"type": "json_object"}
+    assert judge.call_kwargs[0]["response_format"] == {"type": "json_object"}
     assert [turn.assistant_response for turn in conversation.turns] == [
         "Alpha is A.",
         "Beta is B.",

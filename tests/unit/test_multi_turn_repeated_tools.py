@@ -108,6 +108,50 @@ def test_cross_turn_aggregates_may_use_an_expanded_visible_dataset():
     assert generator._validate_cross_turn_consistency(current, context) == []
 
 
+def test_cross_turn_validator_reads_call_preserving_aggregate():
+    generator = object.__new__(MultiTurnGenerator)
+    current = [
+        TrajectoryStep(
+            step_number=1,
+            tool_calls=[
+                ToolCallWithOutput(
+                    tool_name="book_flight",
+                    arguments={"travel_from": "JFK", "travel_to": "LHR"},
+                    output={"booking_id": "B-1"},
+                )
+            ],
+        )
+    ]
+    context = {
+        "turn_outputs": [
+            {
+                "calls": [
+                    {
+                        "call_id": "s1_c1",
+                        "tool_name": "get_nearest_airport_by_city",
+                        "arguments": {"city": "New York"},
+                        "output": {"nearest_airport": "JFK"},
+                    },
+                    {
+                        "call_id": "s2_c1",
+                        "tool_name": "get_nearest_airport_by_city",
+                        "arguments": {"city": "London"},
+                        "output": {"nearest_airport": "LHR"},
+                    },
+                ],
+                "by_tool": {
+                    "get_nearest_airport_by_city": [
+                        {"nearest_airport": "JFK"},
+                        {"nearest_airport": "LHR"},
+                    ]
+                },
+            }
+        ]
+    }
+
+    assert generator._validate_cross_turn_consistency(current, context) == []
+
+
 def _events_blueprint_generator(turns, action_counts):
     llm = MagicMock()
     llm.generate.return_value = json.dumps(
@@ -225,6 +269,34 @@ def test_capability_judge_receives_output_schema_shape():
     assert issues == []
     assert '"output_schema"' in prompt
     assert "single object is not a list" in prompt
+    assert "CALL NECESSITY" in prompt
+    response_format = llm.generate.call_args.kwargs["response_format"]
+    assert response_format["type"] == "json_schema"
+    verdict_schema = response_format["json_schema"]["schema"]
+    assert verdict_schema["required"] == ["is_valid", "issues"]
+    assert verdict_schema["additionalProperties"] is False
+
+
+def test_capability_judge_fails_closed_on_invalid_response():
+    llm = MagicMock()
+    llm.generate.return_value = "not-json"
+    manager = MagicMock()
+    manager.get_tool_schema.return_value = {
+        "name": "lookup",
+        "description": "Look up one item.",
+        "parameters": {"type": "object", "properties": {}},
+        "output_schema": {"type": "object", "properties": {}},
+    }
+    generator = MultiTurnGenerator(llm, manager)
+
+    valid, issues = generator._verify_blueprint_capabilities(
+        [{"user_query": "Look it up.", "expected_tools": ["lookup"]}],
+        None,
+        {},
+    )
+
+    assert valid is False
+    assert issues and issues[0].startswith("Capability check error:")
 
 
 def test_posting_entity_validator_ignores_followup_pronouns():

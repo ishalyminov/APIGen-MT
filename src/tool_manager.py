@@ -844,17 +844,20 @@ class ToolManager:
         The snapshot is a deep copy so callers can freely mutate it without
         affecting the live instances.
         """
-        import json as _json
-
         state: Dict[str, Dict[str, Any]] = {}
         for class_key, instance in self.python_tool_instances.items():
             raw = vars(instance)
-            # Round-trip through JSON to guarantee serialisability & deep copy
+            # Deep-copy directly so live rollback preserves key types (notably
+            # integer trading order IDs).  A JSON dumps check still guarantees
+            # that snapshots can be archived, but must not be used as the copy
+            # mechanism because JSON object keys round-trip as strings.
             try:
-                state[class_key] = _json.loads(_json.dumps(raw, default=str))
+                snapshot = copy.deepcopy(raw)
+                json.dumps(snapshot, default=str)
+                state[class_key] = snapshot
             except (TypeError, ValueError):
                 # Fallback: str-ify anything that fails
-                state[class_key] = _json.loads(_json.dumps(
+                state[class_key] = json.loads(json.dumps(
                     {k: str(v) for k, v in raw.items()}
                 ))
         return state
@@ -878,9 +881,13 @@ class ToolManager:
                 continue
 
             instance = self.python_tool_instances[class_key]
+            custom_restore = getattr(instance, "restore_state", None)
+            if callable(custom_restore):
+                custom_restore(copy.deepcopy(instance_state))
+                continue
             for key, value in instance_state.items():
                 try:
-                    setattr(instance, key, value)
+                    setattr(instance, key, copy.deepcopy(value))
                 except (AttributeError, TypeError) as e:
                     print(f"  Warning: Could not restore {class_key}.{key}: {e}")
 

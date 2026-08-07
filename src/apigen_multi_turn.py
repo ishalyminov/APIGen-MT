@@ -9,6 +9,7 @@ import json
 import copy
 import time
 import os
+import random
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Tuple
 from pydantic import BaseModel, Field
@@ -107,6 +108,9 @@ class MultiTurnGenerator(StepByStepGenerator):
         optimized_pipeline: Optional[bool] = None,
         blueprint_max_actions_per_turn: Optional[int] = None,
         blueprint_actions_per_turn: Optional[List[int]] = None,
+        symbolic_episode_plan: bool = False,
+        blueprint_min_total_actions: Optional[int] = None,
+        blueprint_max_total_actions: Optional[int] = None,
     ):
         super().__init__(
             llm_client,
@@ -117,10 +121,16 @@ class MultiTurnGenerator(StepByStepGenerator):
             optimized_pipeline=optimized_pipeline,
         )
         self.num_turns = num_turns
+        # V2 asks the blueprint model for both natural user utterances and the
+        # complete symbolic call graph.  Python then materializes and executes
+        # that graph directly, eliminating one paid compiler request per turn.
+        # Keep the constructor default off for callers that depend on the old
+        # blueprint contract; the generation CLI enables it by default.
+        self.symbolic_episode_plan = bool(symbolic_episode_plan)
         self.blueprint_max_actions_per_turn = max(
             1,
             min(
-                6,
+                10,
                 (
                     actions_per_turn
                     if blueprint_max_actions_per_turn is None
@@ -128,6 +138,45 @@ class MultiTurnGenerator(StepByStepGenerator):
                 ),
             ),
         )
+        self.blueprint_min_total_actions = (
+            max(self.num_turns, int(blueprint_min_total_actions))
+            if blueprint_min_total_actions is not None
+            else None
+        )
+        if (
+            self.blueprint_min_total_actions is not None
+            and self.blueprint_min_total_actions
+            > self.num_turns * self.blueprint_max_actions_per_turn
+        ):
+            raise ValueError(
+                "blueprint_min_total_actions exceeds the available per-turn "
+                "action capacity"
+            )
+        self.blueprint_max_total_actions = (
+            min(
+                self.num_turns * self.blueprint_max_actions_per_turn,
+                int(blueprint_max_total_actions),
+            )
+            if blueprint_max_total_actions is not None
+            else None
+        )
+        if (
+            self.blueprint_max_total_actions is not None
+            and self.blueprint_max_total_actions < self.num_turns
+        ):
+            raise ValueError(
+                "blueprint_max_total_actions cannot be smaller than num_turns"
+            )
+        if (
+            self.blueprint_min_total_actions is not None
+            and self.blueprint_max_total_actions is not None
+            and self.blueprint_min_total_actions
+            > self.blueprint_max_total_actions
+        ):
+            raise ValueError(
+                "blueprint_min_total_actions exceeds "
+                "blueprint_max_total_actions"
+            )
         self.blueprint_actions_per_turn = (
             list(blueprint_actions_per_turn)
             if blueprint_actions_per_turn is not None
@@ -159,6 +208,861 @@ class MultiTurnGenerator(StepByStepGenerator):
         self.last_failure: Optional[Dict[str, Any]] = None
         self.last_partial_candidate: Optional[Dict[str, Any]] = None
         self._active_generation_directive: Dict[str, Any] = {}
+
+    @staticmethod
+    def _output_schema_supports_path(
+        output_schema: Dict[str, Any], path: str
+    ) -> bool:
+        """Return whether a declared output schema contains ``path``.
+
+        Missing/empty output schemas are intentionally permissive: runtime
+        simulator output remains authoritative for legacy tool definitions.
+        """
+        if not isinstance(output_schema, dict) or not output_schema:
+            return True
+        current: Any = output_schema
+        normalised = str(path or "").replace("[", ".").replace("]", "")
+        for part in [item for item in normalised.split(".") if item]:
+            if not isinstance(current, dict):
+                return False
+            schema_type = current.get("type")
+            if schema_type == "array" or (
+                "items" in current and str(part).isdigit()
+            ):
+                if not str(part).isdigit():
+                    return False
+                items = current.get("items")
+                # Several imported BFCL contracts declare only ``array`` and
+                # omit the item schema.  The nested shape is genuinely unknown,
+                # not forbidden; simulator path resolution will validate it at
+                # execution time.
+                if not isinstance(items, dict) or not items:
+                    return True
+                current = items
+                continue
+            properties = current.get("properties", {})
+            if not isinstance(properties, dict) or part not in properties:
+                return False
+            current = properties[part]
+        return True
+
+    def _validate_symbolic_source_tree(
+        self,
+        *,
+        spec: Any,
+        schema: Dict[str, Any],
+        visible_text: str,
+        seen_calls: Dict[str, Dict[str, Any]],
+        label: str,
+        errors: List[str],
+    ) -> set[str]:
+        """Validate every provenance leaf of one (possibly nested) argument."""
+        dependencies: set[str] = set()
+        if isinstance(spec, dict) and "source" not in spec:
+            schema_type = str(schema.get("type", "")).casefold()
+            properties = schema.get("properties", {})
+            if schema_type not in {"object", "dict"} and not properties:
+                errors.append(f"{label}: missing provenance source.")
+                return dependencies
+            required = schema.get("required", [])
+            missing = [name for name in required if name not in spec]
+            if missing:
+                errors.append(
+                    f"{label}: missing required nested fields {missing}."
+                )
+            if schema.get("additionalProperties", True) is False:
+                extra = [name for name in spec if name not in properties]
+                if extra:
+                    errors.append(f"{label}: undeclared nested fields {extra}.")
+            for name, child in spec.items():
+                child_schema = (
+                    properties.get(name, {})
+                    if isinstance(properties, dict)
+                    else {}
+                )
+                dependencies.update(
+                    self._validate_symbolic_source_tree(
+                        spec=child,
+                        schema=child_schema,
+                        visible_text=visible_text,
+                        seen_calls=seen_calls,
+                        label=f"{label}.{name}",
+                        errors=errors,
+                    )
+                )
+            return dependencies
+        if isinstance(spec, list):
+            schema_type = str(schema.get("type", "")).casefold()
+            if schema_type not in {"array", "list"}:
+                errors.append(f"{label}: list value has no array provenance schema.")
+                return dependencies
+            item_schema = schema.get("items", {})
+            for index, child in enumerate(spec):
+                dependencies.update(
+                    self._validate_symbolic_source_tree(
+                        spec=child,
+                        schema=(
+                            item_schema if isinstance(item_schema, dict) else {}
+                        ),
+                        visible_text=visible_text,
+                        seen_calls=seen_calls,
+                        label=f"{label}[{index}]",
+                        errors=errors,
+                    )
+                )
+            return dependencies
+        if not isinstance(spec, dict):
+            errors.append(f"{label}: missing provenance object.")
+            return dependencies
+
+        source = str(spec.get("source", "")).casefold()
+        if source == "tool_output":
+            producer_id = str(spec.get("call_id", ""))
+            path = str(spec.get("path", ""))
+            producer = seen_calls.get(producer_id)
+            if producer is None:
+                errors.append(
+                    f"{label}: '{producer_id}' is not an earlier call."
+                )
+                return dependencies
+            producer_output = producer["schema"].get("output_schema", {})
+            if not self._output_schema_supports_path(producer_output, path):
+                errors.append(
+                    f"{label}: output path '{producer_id}.{path}' is not declared."
+                )
+            dependencies.add(producer_id)
+        elif source in {"user", "history"}:
+            if "value" not in spec:
+                errors.append(f"{label}: literal provenance has no value.")
+                return dependencies
+            value = spec.get("value")
+            schema_declares_value = (
+                value == schema.get("const")
+                or value in schema.get("enum", [])
+            )
+            if (
+                not schema_declares_value
+                and not self._value_visible_in_text(value, visible_text)
+            ):
+                errors.append(
+                    f"{label}: declared {source} value is not visible in the "
+                    "current/prior user utterances."
+                )
+        elif source == "schema_default":
+            if "default" not in schema:
+                errors.append(
+                    f"{label}: schema_default is not declared by the schema."
+                )
+        else:
+            errors.append(f"{label}: unsupported source '{source}'.")
+        return dependencies
+
+    def _normalise_policy_visible_argument_spec(
+        self,
+        *,
+        spec: Any,
+        schema: Dict[str, Any],
+        current_user_query: str,
+        prior_user_text: str,
+    ) -> Any:
+        """Recover omitted provenance only when it is deterministic and safe.
+
+        Teachers occasionally emit a raw literal despite the requested source
+        wrapper, especially ``[]`` for optional list defaults.  Rejecting the
+        entire episode and regenerating it is unnecessary when Python can prove
+        that the value is a declared schema default or is literally visible to
+        the policy.  Anything else is left untouched and the normal fail-closed
+        provenance validator rejects it.
+        """
+        if isinstance(spec, dict) and "source" in spec:
+            return copy.deepcopy(spec)
+        if "default" in schema and spec == schema.get("default"):
+            return {"source": "schema_default"}
+        if self._value_visible_in_text(spec, current_user_query):
+            return {"source": "user", "value": copy.deepcopy(spec)}
+        if prior_user_text and self._value_visible_in_text(spec, prior_user_text):
+            return {"source": "history", "value": copy.deepcopy(spec)}
+        return copy.deepcopy(spec)
+
+    @staticmethod
+    def _unique_prior_output_binding(
+        argument_name: str,
+        seen_calls: Dict[str, Dict[str, Any]],
+    ) -> Optional[Dict[str, str]]:
+        """Bind an opaque argument to one unambiguous earlier output.
+
+        This is a deterministic compiler repair, not a guessed value.  It is
+        deliberately limited to top-level declared output fields and requires
+        exactly one producer in the preceding graph.
+        """
+        aliases = {
+            "stock": ("stock", "symbol"),
+            "receiver_id": ("receiver_id", "user_id"),
+        }
+        candidate_fields = aliases.get(argument_name, (argument_name,))
+        candidates: List[Tuple[str, str]] = []
+        for call_id, call in seen_calls.items():
+            output_schema = call.get("schema", {}).get("output_schema", {})
+            properties = (
+                output_schema.get("properties", {})
+                if isinstance(output_schema, dict)
+                else {}
+            )
+            if not isinstance(properties, dict):
+                continue
+            for field_name in candidate_fields:
+                if field_name in properties:
+                    candidates.append((call_id, field_name))
+        if len(candidates) != 1:
+            return None
+        call_id, path = candidates[0]
+        return {
+            "source": "tool_output",
+            "call_id": call_id,
+            "path": path,
+        }
+
+    def _repair_invalid_output_passthrough(
+        self,
+        *,
+        spec: Any,
+        argument_name: str,
+        seen_calls: Dict[str, Dict[str, Any]],
+    ) -> Any:
+        """Reuse a prior visible input when a teacher treats it as output.
+
+        File tools commonly return only ``success`` even though the next call
+        needs the destination path that the user supplied to the mutation.
+        Reusing that already policy-visible input is deterministic.  The
+        repair is intentionally limited to identical fields and explicit file
+        path aliases; it never turns a display name into an opaque identifier.
+        """
+        if isinstance(spec, dict) and spec.get("source") == "tool_output":
+            producer = seen_calls.get(str(spec.get("call_id", "")))
+            path = str(spec.get("path", ""))
+            if producer is None or not path or "." in path or "[" in path:
+                return copy.deepcopy(spec)
+            output_schema = producer.get("schema", {}).get(
+                "output_schema", {}
+            )
+            if self._output_schema_supports_path(output_schema, path):
+                return copy.deepcopy(spec)
+            compatible = argument_name == path or (
+                argument_name in {"file_name", "file_name1", "file_name2"}
+                and path in {"source", "destination", "file_name", "path"}
+            )
+            producer_arguments = producer.get("arguments", {})
+            if compatible and path in producer_arguments:
+                return copy.deepcopy(producer_arguments[path])
+            return copy.deepcopy(spec)
+        if isinstance(spec, dict):
+            return {
+                name: self._repair_invalid_output_passthrough(
+                    spec=child,
+                    argument_name=name,
+                    seen_calls=seen_calls,
+                )
+                for name, child in spec.items()
+            }
+        if isinstance(spec, list):
+            return [
+                self._repair_invalid_output_passthrough(
+                    spec=child,
+                    argument_name=argument_name,
+                    seen_calls=seen_calls,
+                )
+                for child in spec
+            ]
+        return copy.deepcopy(spec)
+
+    @staticmethod
+    def _safe_literal_closure_clause(
+        argument_name: str,
+        value: Any,
+        schema: Dict[str, Any],
+    ) -> Optional[str]:
+        """Return a natural clause for a safe, non-secret user constraint.
+
+        Cheap teachers sometimes provide a perfectly ordinary numeric/date
+        constraint in the symbolic arguments but omit it from the utterance.
+        Python may make that proposed value policy-visible without another LLM
+        call.  Opaque identifiers and credentials are never exposed this way.
+        """
+        lowered = argument_name.casefold()
+        blocked_fragments = (
+            "_id", "token", "password", "secret", "credential",
+            "api_key", "account_number", "card_number", "username",
+        )
+        if lowered == "id" or any(item in lowered for item in blocked_fragments):
+            return None
+        scalar = isinstance(value, (str, int, float, bool)) or value is None
+        scalar_list = isinstance(value, list) and all(
+            isinstance(item, (str, int, float, bool)) or item is None
+            for item in value
+        )
+        if not (scalar or scalar_list) or isinstance(value, dict):
+            return None
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+        if isinstance(value, str):
+            rendered = value
+        elif isinstance(value, list):
+            rendered = ", ".join(str(item) for item in value)
+        templates = {
+            "order_type": f"Make it a {rendered} order.",
+            "xact_type": f"Make it a {rendered} transaction.",
+            "start_date": f"Use {rendered} as the start date.",
+            "end_date": f"Use {rendered} as the end date.",
+            "min_price": f"Use a minimum price of {rendered}.",
+            "max_price": f"Use a maximum price of {rendered}.",
+            "threshold": f"Use a threshold of {rendered}.",
+            "amount": f"Use an amount of {rendered}.",
+            "price": f"Use a price of {rendered}.",
+            "symbol": f"Use the ticker symbol {rendered}.",
+            "stock": f"Use {rendered} as the stock.",
+            "sector": f"Focus on the {rendered} sector.",
+            "destination": f"Set the destination to {rendered}.",
+            "option": f"Use the {rendered} option.",
+            "door": f"Apply that to the {rendered} door.",
+            "priority": f"Set the priority to {rendered}.",
+            "status": f"Set the status to {rendered}.",
+            "owner": f"Assign it to {rendered}.",
+            "description": f"Use {rendered} as the description.",
+            "file_name": f"Use the file {rendered}.",
+            "file_name1": f"Use {rendered} as the first file.",
+            "file_name2": f"Use {rendered} as the second file.",
+            "numbers": f"Use the values {rendered}.",
+        }
+        return templates.get(
+            lowered,
+            f"Use {rendered} for the {lowered.replace('_', ' ')}.",
+        )
+
+    def _close_safe_nested_literal_sources(
+        self,
+        *,
+        spec: Any,
+        schema: Dict[str, Any],
+        visible_text: str,
+        seen_calls: Dict[str, Dict[str, Any]],
+        added_closure_values: Dict[str, Any],
+        path: Tuple[str, ...],
+    ) -> Tuple[Any, List[str]]:
+        """Expose safe missing literals inside composite arguments.
+
+        Top-level arguments already receive this deterministic repair in the
+        normalizer.  Object arguments such as ``updates.priority`` previously
+        skipped it, causing an otherwise executable episode to be regenerated.
+        Opaque IDs and credentials still return no clause and remain subject to
+        the fail-closed provenance validator.
+        """
+        if isinstance(spec, dict) and "source" in spec:
+            source = str(spec.get("source", "")).casefold()
+            if source not in {"user", "history"} or "value" not in spec:
+                return copy.deepcopy(spec), []
+            value = spec.get("value")
+            schema_declares_value = (
+                value == schema.get("const")
+                or value in schema.get("enum", [])
+            )
+            if schema_declares_value or self._value_visible_in_text(
+                value, visible_text
+            ):
+                return copy.deepcopy(spec), []
+            argument_name = path[-1]
+            prior_binding = self._unique_prior_output_binding(
+                argument_name, seen_calls
+            )
+            if prior_binding is not None:
+                return prior_binding, []
+            closure_key = ".".join(path) + "=" + json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            clause = self._safe_literal_closure_clause(
+                argument_name, value, schema
+            )
+            if clause is None:
+                return copy.deepcopy(spec), []
+            if closure_key in added_closure_values:
+                clauses: List[str] = []
+            else:
+                added_closure_values[closure_key] = copy.deepcopy(value)
+                clauses = [clause]
+            return {
+                "source": "user",
+                "value": copy.deepcopy(value),
+            }, clauses
+
+        schema_type = str(schema.get("type", "")).casefold()
+        if isinstance(spec, dict) and (
+            schema_type in {"object", "dict"}
+            or isinstance(schema.get("properties"), dict)
+        ):
+            properties = schema.get("properties", {})
+            repaired: Dict[str, Any] = {}
+            clauses: List[str] = []
+            for name, child in spec.items():
+                child_schema = (
+                    properties.get(name, {})
+                    if isinstance(properties, dict)
+                    else {}
+                )
+                repaired_child, child_clauses = (
+                    self._close_safe_nested_literal_sources(
+                        spec=child,
+                        schema=child_schema,
+                        visible_text=visible_text,
+                        seen_calls=seen_calls,
+                        added_closure_values=added_closure_values,
+                        path=(*path, name),
+                    )
+                )
+                repaired[name] = repaired_child
+                clauses.extend(child_clauses)
+            return repaired, clauses
+
+        # Safely normalize a raw nested scalar/list using the same rules as a
+        # top-level argument. Composite objects are deliberately not serialized
+        # into the user's utterance.
+        if "default" in schema and spec == schema.get("default"):
+            return {"source": "schema_default"}, []
+        if self._value_visible_in_text(spec, visible_text):
+            return {"source": "user", "value": copy.deepcopy(spec)}, []
+        argument_name = path[-1]
+        closure_key = ".".join(path) + "=" + json.dumps(
+            spec,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+        clause = self._safe_literal_closure_clause(
+            argument_name, spec, schema
+        )
+        if clause is None:
+            return copy.deepcopy(spec), []
+        clauses = []
+        if closure_key not in added_closure_values:
+            added_closure_values[closure_key] = copy.deepcopy(spec)
+            clauses = [clause]
+        return {"source": "user", "value": copy.deepcopy(spec)}, clauses
+
+    def _normalise_symbolic_blueprint_turns(
+        self,
+        turns: List[Dict[str, Any]],
+        *,
+        available_tool_names: set[str],
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Validate and canonicalize an episode-wide symbolic call graph.
+
+        This is deliberately deterministic.  It checks the graph, schemas,
+        provenance declarations and user-visible literal closure before any
+        simulator mutation occurs.  Concrete tool outputs are never predicted
+        by the teacher; later arguments retain symbolic call-id/path bindings.
+        """
+        errors: List[str] = []
+        canonical_turns: List[Dict[str, Any]] = []
+        seen_calls: Dict[str, Dict[str, Any]] = {}
+        visible_user_queries: List[str] = []
+
+        for turn_index, raw_turn in enumerate(turns, 1):
+            if not isinstance(raw_turn, dict):
+                errors.append(f"Turn {turn_index} is not an object.")
+                continue
+            query = str(raw_turn.get("user_query", "")).strip()
+            if not query:
+                errors.append(f"Turn {turn_index} has no user_query.")
+            raw_calls = raw_turn.get("calls")
+            if not isinstance(raw_calls, list) or not raw_calls:
+                errors.append(f"Turn {turn_index} has no symbolic calls.")
+                raw_calls = []
+            if len(raw_calls) > self.blueprint_max_actions_per_turn:
+                errors.append(
+                    f"Turn {turn_index} has {len(raw_calls)} calls; maximum is "
+                    f"{self.blueprint_max_actions_per_turn}."
+                )
+
+            canonical_calls: List[Dict[str, Any]] = []
+            expected_tools: List[str] = []
+            visible_text = "\n".join([*visible_user_queries, query])
+            added_closure_values: Dict[str, Any] = {}
+            for call_index, raw_call in enumerate(raw_calls, 1):
+                if not isinstance(raw_call, dict):
+                    errors.append(
+                        f"Turn {turn_index} call {call_index} is not an object."
+                    )
+                    continue
+                call_id = str(raw_call.get("call_id", "")).strip()
+                tool_name = str(raw_call.get("tool_name", "")).strip()
+                if not call_id:
+                    errors.append(
+                        f"Turn {turn_index} call {call_index} has no call_id."
+                    )
+                elif call_id in seen_calls:
+                    errors.append(f"Duplicate call_id '{call_id}'.")
+                if tool_name not in available_tool_names:
+                    errors.append(
+                        f"Turn {turn_index} call {call_id or call_index} uses "
+                        f"unavailable tool '{tool_name}'."
+                    )
+                    continue
+                if raw_call.get("parallel_group") not in (None, ""):
+                    errors.append(
+                        f"Turn {turn_index} call {call_id} declares a parallel "
+                        "group, but symbolic_episode_plan_v2 is sequential."
+                    )
+
+                schema = self.tool_manager.get_tool_schema(tool_name)
+                parameters = schema.get("parameters", {})
+                properties = parameters.get("properties", {})
+                argument_specs = copy.deepcopy(raw_call.get("arguments"))
+                if not isinstance(argument_specs, dict):
+                    errors.append(
+                        f"Turn {turn_index} call {call_id}: arguments must be an object."
+                    )
+                    argument_specs = {}
+                prior_user_text = "\n".join(visible_user_queries)
+                argument_specs = {
+                    argument_name: self._normalise_policy_visible_argument_spec(
+                        spec=source_spec,
+                        schema=(
+                            properties.get(argument_name, {})
+                            if isinstance(properties, dict)
+                            else {}
+                        ),
+                        current_user_query=query,
+                        prior_user_text=prior_user_text,
+                    )
+                    for argument_name, source_spec in argument_specs.items()
+                }
+                for argument_name, source_spec in list(argument_specs.items()):
+                    if not (
+                        isinstance(source_spec, dict)
+                        and source_spec.get("source") in {"user", "history"}
+                        and "value" in source_spec
+                    ):
+                        continue
+                    value = source_spec.get("value")
+                    argument_schema = (
+                        properties.get(argument_name, {})
+                        if isinstance(properties, dict)
+                        else {}
+                    )
+                    schema_declares_value = (
+                        value == argument_schema.get("const")
+                        or value in argument_schema.get("enum", [])
+                    )
+                    if schema_declares_value or self._value_visible_in_text(
+                        value, visible_text
+                    ):
+                        continue
+                    prior_binding = self._unique_prior_output_binding(
+                        argument_name, seen_calls
+                    )
+                    if prior_binding is not None:
+                        argument_specs[argument_name] = prior_binding
+                        continue
+                    closure_key = argument_name + "=" + json.dumps(
+                        value,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    )
+                    clause = self._safe_literal_closure_clause(
+                        argument_name, value, argument_schema
+                    )
+                    if clause is None:
+                        continue
+                    if closure_key not in added_closure_values:
+                        query = query.rstrip()
+                        if query and query[-1] not in ".!?":
+                            query += "."
+                        query = f"{query} {clause}".strip()
+                        added_closure_values[closure_key] = copy.deepcopy(value)
+                        visible_text = "\n".join(
+                            [*visible_user_queries, query]
+                        )
+                    argument_specs[argument_name] = {
+                        "source": "user",
+                        "value": copy.deepcopy(value),
+                    }
+                for argument_name, source_spec in list(argument_specs.items()):
+                    if not (
+                        isinstance(source_spec, (dict, list))
+                        and not (
+                            isinstance(source_spec, dict)
+                            and "source" in source_spec
+                        )
+                    ):
+                        continue
+                    argument_schema = (
+                        properties.get(argument_name, {})
+                        if isinstance(properties, dict)
+                        else {}
+                    )
+                    repaired, clauses = self._close_safe_nested_literal_sources(
+                        spec=source_spec,
+                        schema=argument_schema,
+                        visible_text=visible_text,
+                        seen_calls=seen_calls,
+                        added_closure_values=added_closure_values,
+                        path=(argument_name,),
+                    )
+                    argument_specs[argument_name] = repaired
+                    for clause in clauses:
+                        query = query.rstrip()
+                        if query and query[-1] not in ".!?":
+                            query += "."
+                        query = f"{query} {clause}".strip()
+                    if clauses:
+                        visible_text = "\n".join(
+                            [*visible_user_queries, query]
+                        )
+                argument_specs = {
+                    argument_name: self._repair_invalid_output_passthrough(
+                        spec=source_spec,
+                        argument_name=argument_name,
+                        seen_calls=seen_calls,
+                    )
+                    for argument_name, source_spec in argument_specs.items()
+                }
+                missing = [
+                    name
+                    for name in parameters.get("required", [])
+                    if name not in argument_specs
+                ]
+                if missing:
+                    errors.append(
+                        f"Turn {turn_index} call {call_id}: missing required "
+                        f"argument sources {missing}."
+                    )
+                if parameters.get("additionalProperties", True) is False:
+                    extra = [
+                        name for name in argument_specs if name not in properties
+                    ]
+                    if extra:
+                        errors.append(
+                            f"Turn {turn_index} call {call_id}: undeclared "
+                            f"arguments {extra}."
+                        )
+
+                dependencies: set[str] = set()
+                # ``depends_on`` carries ordering constraints that are not
+                # necessarily data dependencies (authenticate -> protected
+                # read, mutation -> verification, "then" semantics).  V2
+                # previously rebuilt this field only from tool-output
+                # provenance and silently discarded the teacher's explicit
+                # edges.  Besides making the archived graph inaccurate, that
+                # caused the semantic judge to reject otherwise valid plans
+                # and pay for a complete blueprint regeneration.
+                raw_dependencies = raw_call.get("depends_on", [])
+                if not isinstance(raw_dependencies, list):
+                    errors.append(
+                        f"Turn {turn_index} call {call_id}: depends_on must "
+                        "be an array."
+                    )
+                    raw_dependencies = []
+                for dependency in raw_dependencies:
+                    dependency_id = str(dependency).strip()
+                    if not dependency_id:
+                        errors.append(
+                            f"Turn {turn_index} call {call_id}: depends_on "
+                            "contains an empty call ID."
+                        )
+                        continue
+                    if dependency_id not in seen_calls:
+                        errors.append(
+                            f"Turn {turn_index} call {call_id}: dependency "
+                            f"'{dependency_id}' is not an earlier call."
+                        )
+                        continue
+                    dependencies.add(dependency_id)
+                for argument_name, source_spec in argument_specs.items():
+                    argument_schema = properties.get(argument_name, {})
+                    dependencies.update(
+                        self._validate_symbolic_source_tree(
+                            spec=source_spec,
+                            schema=argument_schema,
+                            visible_text=visible_text,
+                            seen_calls=seen_calls,
+                            label=(
+                                f"Turn {turn_index} call "
+                                f"{call_id}.{argument_name}"
+                            ),
+                            errors=errors,
+                        )
+                    )
+
+                canonical = {
+                    "call_id": call_id,
+                    "tool_name": tool_name,
+                    "arguments": copy.deepcopy(argument_specs),
+                    "depends_on": sorted(dependencies),
+                    "parallel_group": None,
+                }
+                canonical_calls.append(canonical)
+                expected_tools.append(tool_name)
+                if call_id:
+                    seen_calls[call_id] = {
+                        "turn": turn_index,
+                        "schema": schema,
+                        "arguments": copy.deepcopy(argument_specs),
+                    }
+
+            canonical_turns.append(
+                {
+                    "user_query": query,
+                    "intent": str(raw_turn.get("intent", "")).strip(),
+                    "calls": canonical_calls,
+                    # Retain the compatibility view used by existing quality
+                    # gates, schedulers and evaluation exporters.
+                    "expected_tools": expected_tools,
+                }
+            )
+            visible_user_queries.append(query)
+
+        return canonical_turns, errors
+
+    def _execute_symbolic_blueprint_turn(
+        self,
+        *,
+        query_result: QueryGenerationResult,
+        turn_spec: Dict[str, Any],
+        execution_context: Dict[str, Any],
+    ) -> Tuple[Optional[List[TrajectoryStep]], Optional[Dict[str, Any]]]:
+        self._last_symbolic_execution_error = None
+        compiled_calls = [
+            {
+                "call_id": str(call.get("call_id", "")),
+                "tool_name": str(call.get("tool_name", "")),
+                "argument_specs": copy.deepcopy(call.get("arguments", {})),
+            }
+            for call in turn_spec.get("calls", [])
+        ]
+        try:
+            return self._execute_compiled_turn(
+                query=query_result.query,
+                compiled_calls=compiled_calls,
+                execution_context=execution_context,
+            )
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            self._last_symbolic_execution_error = str(exc) or type(exc).__name__
+            print(f"  Symbolic episode-plan execution failed: {exc}")
+            return None, None
+
+    def _preflight_symbolic_blueprint_execution(
+        self,
+        turns: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Dry-run a symbolic episode and restore the exact simulator state.
+
+        Structural schemas cannot prove that an array path resolves to the
+        required scalar or that a planned mutation has an effect in the sampled
+        state.  Catch those deterministic failures while Stage 0 can give one
+        compact repair message to the teacher, before semantic judging and
+        before the candidate is committed.
+        """
+        if not self._python_tools_available:
+            return []
+        initial_state = self.tool_manager.get_api_state()
+        execution_context: Dict[str, Any] = {}
+        try:
+            for turn_index, turn in enumerate(turns, 1):
+                query = str(turn.get("user_query", ""))
+                query_result = QueryGenerationResult(
+                    query=query,
+                    intent=str(turn.get("intent", "")),
+                    expected_tools=list(turn.get("expected_tools", [])),
+                    quality_preflight={"passed": True},
+                )
+                trajectory, updated_context = (
+                    self._execute_symbolic_blueprint_turn(
+                        query_result=query_result,
+                        turn_spec=turn,
+                        execution_context=execution_context,
+                    )
+                )
+                if trajectory is None or updated_context is None:
+                    detail = getattr(
+                        self,
+                        "_last_symbolic_execution_error",
+                        None,
+                    ) or "deterministic execution failed"
+                    return [f"Turn {turn_index}: {detail}"]
+                execution_context = updated_context
+                execution_context.setdefault("turn_outputs", []).append(
+                    self._aggregate_turn_outputs(trajectory)
+                )
+                execution_context.setdefault("prior_user_queries", []).append(
+                    query
+                )
+            return []
+        finally:
+            self.tool_manager.restore_api_state(initial_state)
+
+    @staticmethod
+    def _symbolic_plan_metrics(
+        turns: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        call_turn: Dict[str, int] = {}
+        for turn_index, turn in enumerate(turns, 1):
+            for call in turn.get("calls", []):
+                call_turn[str(call.get("call_id", ""))] = turn_index
+
+        source_counts: Dict[str, int] = {}
+        total_arguments = 0
+        hidden_argument_count = 0
+        tool_output_bindings = 0
+        cross_turn_bindings = 0
+        for turn_index, turn in enumerate(turns, 1):
+            for call in turn.get("calls", []):
+                for spec in call.get("arguments", {}).values():
+                    total_arguments += 1
+                    stack = [spec]
+                    argument_has_valid_source = False
+                    argument_has_invalid_leaf = False
+                    while stack:
+                        item = stack.pop()
+                        if isinstance(item, dict) and "source" in item:
+                            source = str(item.get("source", "")).casefold()
+                            source_counts[source] = (
+                                source_counts.get(source, 0) + 1
+                            )
+                            if source in {
+                                "user", "history", "schema_default",
+                                "tool_output",
+                            }:
+                                argument_has_valid_source = True
+                            else:
+                                argument_has_invalid_leaf = True
+                            if source == "tool_output":
+                                tool_output_bindings += 1
+                                producer_turn = call_turn.get(
+                                    str(item.get("call_id", "")), turn_index
+                                )
+                                if producer_turn < turn_index:
+                                    cross_turn_bindings += 1
+                        elif isinstance(item, dict):
+                            stack.extend(item.values())
+                        elif isinstance(item, list):
+                            stack.extend(item)
+                        else:
+                            argument_has_invalid_leaf = True
+                    if argument_has_invalid_leaf or not argument_has_valid_source:
+                        hidden_argument_count += 1
+        return {
+            "total_arguments": total_arguments,
+            "hidden_argument_count": hidden_argument_count,
+            "hidden_argument_fraction": (
+                hidden_argument_count / total_arguments
+                if total_arguments
+                else 0.0
+            ),
+            "argument_source_counts": source_counts,
+            "tool_output_binding_count": tool_output_bindings,
+            "cross_turn_binding_count": cross_turn_bindings,
+        }
 
     def _mark_failure(
         self,
@@ -357,6 +1261,11 @@ Return ONLY one JSON object with exactly one item per supplied turn:
             [{"role": "user", "content": prompt}],
             llm=self.final_response_llm,
             purpose="final_response_generate",
+            # This is a mechanical serialization constraint, not another
+            # semantic check.  Asking the provider to close/escape the JSON
+            # prevents an otherwise complete episode from being discarded
+            # after all of its tools have already executed.
+            response_format={"type": "json_object"},
         )
         result = self._extract_json_object(raw)
         items = result.get("responses")
@@ -461,6 +1370,7 @@ Return ONLY JSON with exactly one item per turn:
                 [{"role": "user", "content": prompt}],
                 llm=self.grounding_judge,
                 purpose="final_response_grounding_judge",
+                response_format={"type": "json_object"},
             )
             result = self._extract_json_object(raw)
             items = result.get("turns")
@@ -823,11 +1733,18 @@ Return ONLY JSON with exactly one item per turn:
                 return None
             self._update_token_usage()
 
-            trajectory, ec = self._stage2_generate_tools(
-                query_result,
-                min(tool_retries, self.max_turn_attempts),
-                initial_execution_context=execution_context,
-            )
+            if self.symbolic_episode_plan:
+                trajectory, ec = self._execute_symbolic_blueprint_turn(
+                    query_result=query_result,
+                    turn_spec=turn_spec,
+                    execution_context=execution_context,
+                )
+            else:
+                trajectory, ec = self._stage2_generate_tools(
+                    query_result,
+                    min(tool_retries, self.max_turn_attempts),
+                    initial_execution_context=execution_context,
+                )
             if trajectory is None:
                 print(
                     f"✗ Turn {turn_idx + 1}: turn compile/repair failed"
@@ -857,6 +1774,9 @@ Return ONLY JSON with exactly one item per turn:
             if 'turn_outputs' not in execution_context:
                 execution_context['turn_outputs'] = []
             execution_context['turn_outputs'].append(turn_output_aggregate)
+            execution_context.setdefault('prior_user_queries', []).append(
+                query_result.query
+            )
 
             assistant_response, response_quality = self._produce_turn_response(
                 turn_index=turn_idx,
@@ -985,18 +1905,35 @@ Return ONLY JSON with exactly one item per turn:
                     if self.blueprint_actions_per_turn is not None
                     else None
                 ),
+                "blueprint_min_total_actions": self.blueprint_min_total_actions,
+                "blueprint_max_total_actions": self.blueprint_max_total_actions,
                 "focus_category": focus_category,
                 "overall_task": blueprint.overall_task,
                 "resumed_from_turn": completed_turns,
                 "blueprint_queries": [t.get("user_query", "") for t in blueprint.turns],
                 "turn_expected_tools": [t.get("expected_tools", []) for t in blueprint.turns],
+                "symbolic_episode_plan": self.symbolic_episode_plan,
+                "symbolic_call_graph": (
+                    copy.deepcopy(blueprint.turns)
+                    if self.symbolic_episode_plan
+                    else None
+                ),
+                "symbolic_plan_metrics": (
+                    self._symbolic_plan_metrics(blueprint.turns)
+                    if self.symbolic_episode_plan
+                    else None
+                ),
                 "rl_quality_gate_passed": True,
                 "model_routing": self._model_routing_metadata(),
                 "tool_contract_hash": self._tool_contract_hash(available_tools),
                 "generation_pipeline": (
-                    "turn_compiler_v1_batched_turn_responses"
-                    if self.optimized_pipeline
-                    else "legacy_per_tool"
+                    "symbolic_episode_plan_v2_batched_turn_responses"
+                    if self.symbolic_episode_plan
+                    else (
+                        "turn_compiler_v1_batched_turn_responses"
+                        if self.optimized_pipeline
+                        else "legacy_per_tool"
+                    )
                 ),
                 "turn_response_policy": (
                     "batched_grounded_per_turn"
@@ -1132,11 +2069,18 @@ Return ONLY JSON with exactly one item per turn:
             # Stage 2: Generate and execute tool invocations (pass persistent execution_context)
             # Note: State adjustment removed - tool calls modify API state which persists,
             # and we pass current API state snapshot to the tool manager LLM
-            trajectory, ec = self._stage2_generate_tools(
-                query_result,
-                min(tool_retries, self.max_turn_attempts),
-                initial_execution_context=execution_context,
-            )
+            if self.symbolic_episode_plan:
+                trajectory, ec = self._execute_symbolic_blueprint_turn(
+                    query_result=query_result,
+                    turn_spec=turn_spec,
+                    execution_context=execution_context,
+                )
+            else:
+                trajectory, ec = self._stage2_generate_tools(
+                    query_result,
+                    min(tool_retries, self.max_turn_attempts),
+                    initial_execution_context=execution_context,
+                )
             if trajectory is None:
                 print(
                     f"✗ Turn {turn_idx + 1}: turn compile/repair failed"
@@ -1204,6 +2148,9 @@ Return ONLY JSON with exactly one item per turn:
             if 'turn_outputs' not in execution_context:
                 execution_context['turn_outputs'] = []
             execution_context['turn_outputs'].append(turn_output_aggregate)
+            execution_context.setdefault('prior_user_queries', []).append(
+                query_result.query
+            )
 
             # Generate assistant response for this turn
             assistant_response, response_quality = self._produce_turn_response(
@@ -1380,17 +2327,34 @@ Return ONLY JSON with exactly one item per turn:
                     if self.blueprint_actions_per_turn is not None
                     else None
                 ),
+                "blueprint_min_total_actions": self.blueprint_min_total_actions,
+                "blueprint_max_total_actions": self.blueprint_max_total_actions,
                 "focus_category": focus_category,
                 "overall_task": blueprint.overall_task,
                 "blueprint_queries": [t.get("user_query", "") for t in blueprint.turns],
                 "turn_expected_tools": [t.get("expected_tools", []) for t in blueprint.turns],
+                "symbolic_episode_plan": self.symbolic_episode_plan,
+                "symbolic_call_graph": (
+                    copy.deepcopy(blueprint.turns)
+                    if self.symbolic_episode_plan
+                    else None
+                ),
+                "symbolic_plan_metrics": (
+                    self._symbolic_plan_metrics(blueprint.turns)
+                    if self.symbolic_episode_plan
+                    else None
+                ),
                 "rl_quality_gate_passed": True,
                 "model_routing": self._model_routing_metadata(),
                 "tool_contract_hash": self._tool_contract_hash(available_tools),
                 "generation_pipeline": (
-                    "turn_compiler_v1_batched_turn_responses"
-                    if self.optimized_pipeline
-                    else "legacy_per_tool"
+                    "symbolic_episode_plan_v2_batched_turn_responses"
+                    if self.symbolic_episode_plan
+                    else (
+                        "turn_compiler_v1_batched_turn_responses"
+                        if self.optimized_pipeline
+                        else "legacy_per_tool"
+                    )
                 ),
                 "turn_response_policy": (
                     "batched_grounded_per_turn"
@@ -1556,6 +2520,60 @@ Return ONLY JSON with exactly one item per turn:
                 if isinstance(retweet, dict) and retweet.get("username"):
                     valid_usernames.add(retweet["username"])
 
+        # Symbolic plans already expose the exact arguments that will be
+        # executed.  Validate those values instead of guessing handles from
+        # nearby English words (for example, "follow both now" previously
+        # treated both ``both`` and ``now`` as usernames and discarded a
+        # valid, already-paid-for blueprint).  Dynamic tool-output bindings
+        # are checked when the simulator materializes them.
+        username_parameters = {
+            "authenticate_twitter": ("username",),
+            "follow_user": ("username_to_follow",),
+            "unfollow_user": ("username_to_unfollow",),
+            "get_user_stats": ("username",),
+            "get_user_tweets": ("username",),
+            "mention": ("mentioned_usernames",),
+        }
+        if any(isinstance(turn.get("calls"), list) for turn in turns):
+            valid_casefolded = {
+                str(username).lstrip("@").casefold()
+                for username in valid_usernames
+            }
+            for turn_idx, turn in enumerate(turns, 1):
+                for call in turn.get("calls", []):
+                    if not isinstance(call, dict):
+                        continue
+                    tool_name = str(call.get("tool_name", ""))
+                    parameter_names = username_parameters.get(tool_name, ())
+                    arguments = call.get("arguments", {})
+                    if not isinstance(arguments, dict):
+                        continue
+                    for parameter_name in parameter_names:
+                        spec = arguments.get(parameter_name)
+                        if not isinstance(spec, dict):
+                            continue
+                        if str(spec.get("source", "")).casefold() not in {
+                            "user",
+                            "history",
+                        }:
+                            continue
+                        value = spec.get("value")
+                        values = value if isinstance(value, list) else [value]
+                        for username in values:
+                            if (
+                                isinstance(username, str)
+                                and username.lstrip("@").casefold()
+                                not in valid_casefolded
+                            ):
+                                issues.append(
+                                    f"Turn {turn_idx}: {tool_name}."
+                                    f"{parameter_name} references username "
+                                    f"'{username}' but it does not exist in "
+                                    "state. Valid users: "
+                                    + ", ".join(sorted(valid_usernames))[:100]
+                                )
+            return issues
+
         # Username extraction patterns from query text
         # More specific patterns to avoid false positives like "user stats" or "user and"
         username_patterns = [
@@ -1573,6 +2591,7 @@ Return ONLY JSON with exactly one item per turn:
         non_username_references = {
             'him', 'her', 'them', 'it', 'me', 'us', 'you',
             'this', 'that', 'these', 'those', 'the', 'a', 'an',
+            'all', 'both', 'each', 'either', 'neither', 'now',
         }
 
         # Check each turn's query for entity references
@@ -1726,8 +2745,19 @@ Return ONLY JSON with exactly one item per turn:
 
         # Build state summary with actual entity values for verification
         state_summary = ""
+        api_class_map = getattr(
+            self.tool_manager, "api_name_to_class_key", {}
+        )
+        if not isinstance(api_class_map, dict):
+            api_class_map = {}
+        selected_class_keys = {
+            api_class_map.get(tool_name) for tool_name in seen_tool_names
+        }
+        selected_class_keys.discard(None)
         if initial_api_state:
             for class_key, state in initial_api_state.items():
+                if selected_class_keys and class_key not in selected_class_keys:
+                    continue
                 if isinstance(state, dict):
                     # Show full state with actual values, not just keys
                     # This allows the judge to verify entity references exist
@@ -1752,6 +2782,14 @@ selected tool returns it.
 {json.dumps(turns, indent=2, default=str)}
 
 === VERIFICATION TASK ===
+Decision calibration: reject only a material capability, grounding,
+provenance, state, necessity, or sufficiency error. Do not reject harmless
+wording, redundancy, or a natural semantic equivalent of an explicit argument
+(for example, “nearest integer” is decimal_places=0). A query may use normal
+singular/plural or unit wording while the fixed argument uses the schema's
+canonical enum token. If every requested outcome is supported and every call
+is necessary, mark the episode valid even when the phrasing is not elegant.
+
 For each turn, verify:
 1. Does the user_query ask for something the selected tool can actually do?
 2. Does the query phrasing match tool capabilities? (e.g., "search all files" can't be done by a single-file grep)
@@ -1779,6 +2817,27 @@ For each turn, verify:
 10. Same-turn output dependencies must respect expected_tools order; a tool may
    consume only output from an earlier tool. Cross-turn references must be
    unambiguous from prior policy-visible results.
+11. A later user_query must not assert a concrete price, ID, status, sensor
+    reading, search result, or other result that only an earlier planned tool
+    will reveal. Natural references such as "that result" are valid; a
+    pre-written outcome is hidden-state leakage. Reject especially when the
+    asserted outcome conflicts with GENERATOR-ONLY CURRENT API STATE.
+12. Authentication and existing-entity calls must be feasible in the supplied
+    state. A display name cannot substitute for an opaque ID. If a selected
+    lookup can produce the ID, require an explicit earlier symbolic binding;
+    otherwise require the exact valid ID in the user utterance.
+13. CALL NECESSITY: map every individual selected-tool occurrence to one
+    explicit clause in the current user_query or a necessary dependency of
+    that clause. Reject any extra lookup, status read, mutation, notification,
+    or verification the user did not request. Reaching a target call count is
+    never a justification.
+14. PLAN SUFFICIENCY: map every independently requested user clause to a tool
+    that can actually satisfy it. Reject a superficially related tool set that
+    omits a required capability (for example, a sector request without a tool
+    that filters or reports sectors).
+15. If a later argument selects one element from an array output, the user must
+    state an ordinal or deterministic criterion. Reject silent index-zero or
+    arbitrary candidate selection.
 
 IMPORTANT: For PostingApi, inspect users, tweet authors, and following_list;
 reject a username absent from all three. Also reject requests outside tool enums
@@ -1795,6 +2854,25 @@ If ALL turns are achievable with their selected tools, set is_valid to true with
                 [{"role": "user", "content": prompt}],
                 llm=self.judge,
                 purpose="blueprint_semantic_judge",
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "blueprint_semantic_verdict",
+                        "strict": True,
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "is_valid": {"type": "boolean"},
+                                "issues": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["is_valid", "issues"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
             )
             response_text = response.strip()
 
@@ -1815,10 +2893,581 @@ If ALL turns are achievable with their selected tools, set is_valid to true with
             return is_valid, issues
 
         except Exception as e:
-            # On error, be permissive and let execution handle it
-            return True, [f"Capability check error (allowing): {str(e)[:100]}"]
+            return False, [f"Capability check error: {str(e)[:100]}"]
 
     # ─────────────────────── Stage 0: Blueprint ───────────────────────
+
+    def _generate_symbolic_blueprint_turnwise(
+        self,
+        *,
+        tools_json: List[Dict[str, Any]],
+        directive: Dict[str, Any],
+        exact_action_schedule: List[int],
+        focus_category: Optional[str],
+        initial_state_context: str,
+        credential_context: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Compile a high-width episode one complete turn per request.
+
+        A cheap teacher often loses schema fidelity when asked to emit 15-20
+        calls in one JSON object.  Turn-level compilation keeps the important
+        architecture unchanged (teacher proposes, Python executes/verifies)
+        while fitting the complete pipeline in ten requests: at most seven
+        blueprint/repair calls plus one semantic judge, one batched response
+        writer and one grounding judge.
+        """
+        available_names = {
+            str(tool.get("name") or tool.get("api_name", ""))
+            for tool in tools_json
+            if tool.get("name") or tool.get("api_name")
+        }
+        tools_str = json.dumps(
+            tools_json, indent=2, ensure_ascii=False, default=str
+        )
+        hard_required = [
+            str(name) for name in directive.get("hard_required_tools", [])
+        ]
+        required_by_turn: List[List[str]] = [
+            [] for _ in exact_action_schedule
+        ]
+        # Spread hard coverage targets without exceeding any turn's exact
+        # capacity.  The first-turn scaffold sees this full map and can make a
+        # coherent episode arc around it.
+        next_turn = 0
+        for tool_name in hard_required:
+            for _ in range(len(required_by_turn)):
+                if (
+                    len(required_by_turn[next_turn])
+                    < exact_action_schedule[next_turn]
+                ):
+                    required_by_turn[next_turn].append(tool_name)
+                    next_turn = (next_turn + 1) % len(required_by_turn)
+                    break
+                next_turn = (next_turn + 1) % len(required_by_turn)
+
+        selected_categories = sorted(
+            {
+                str(tool.get("category", ""))
+                for tool in tools_json
+                if tool.get("category")
+            }
+        )
+        domain_hints = "\n".join(
+            hint
+            for hint in (
+                get_domain_hints(category) for category in selected_categories
+            )
+            if hint
+        )
+        total_calls = sum(exact_action_schedule)
+        accepted_turns: List[Dict[str, Any]] = []
+        overall_task = ""
+        future_intents: List[str] = []
+        # Reserve exactly four calls for batched query alignment, the episode
+        # semantic judge, batched response writer and grounding judge.
+        repair_budget = max(
+            0,
+            min(
+                7 - len(exact_action_schedule),
+                self.max_calls_per_candidate
+                - 4
+                - len(exact_action_schedule),
+            ),
+        )
+
+        for turn_index, required_count in enumerate(
+            exact_action_schedule, start=1
+        ):
+            current_intent = (
+                future_intents[turn_index - 2]
+                if turn_index > 1 and len(future_intents) >= turn_index - 1
+                else ""
+            )
+            feedback = ""
+            attempts = 1 + (1 if repair_budget > 0 else 0)
+            turn_accepted = False
+            for attempt in range(attempts):
+                prior_context = json.dumps(
+                    accepted_turns,
+                    ensure_ascii=False,
+                    indent=2,
+                    default=str,
+                )
+                if turn_index == 1:
+                    output_contract = {
+                        "overall_task": "one coherent user-facing scenario",
+                        "future_turn_intents": [
+                            f"natural intent for turn {index}"
+                            for index in range(2, self.num_turns + 1)
+                        ],
+                        "turn": {
+                            "user_query": "natural compound request",
+                            "intent": "current semantic intent",
+                            "calls": [],
+                        },
+                    }
+                    scaffold_rule = (
+                        f"Also return exactly {self.num_turns - 1} concise "
+                        "future_turn_intents. They must form one realistic "
+                        "conversation arc and anticipate the required tool "
+                        "coverage map below without asserting future results."
+                    )
+                else:
+                    output_contract = {
+                        "turn": {
+                            "user_query": "natural follow-up",
+                            "intent": "current semantic intent",
+                            "calls": [],
+                        }
+                    }
+                    scaffold_rule = (
+                        "Follow the supplied current intent while reacting "
+                        "naturally to prior policy-visible results."
+                    )
+
+                prompt = f"""Compile turn {turn_index}/{self.num_turns} of one
+coherent executable tool-use episode.
+
+=== EPISODE CONTRACT ===
+Total executed calls: exactly {total_calls}.
+Exact calls by turn: {json.dumps(exact_action_schedule)}.
+This turn must contain exactly {required_count} calls with IDs
+t{turn_index}c1 through t{turn_index}c{required_count}; do not omit, add, or
+renumber any call. Write one natural compound user request whose explicit
+deliverables or necessary dependencies motivate every call. Never add filler.
+{scaffold_rule}
+
+Overall task fixed so far: {overall_task or "create it now"}
+Current planned intent: {current_intent or "create it now"}
+Hard required tools for this turn:
+{json.dumps(required_by_turn[turn_index - 1], ensure_ascii=False)}
+Hard-tool allocation for the whole episode:
+{json.dumps(required_by_turn, ensure_ascii=False)}
+
+=== PRIOR ACCEPTED SYMBOLIC TURNS ===
+{prior_context if accepted_turns else "None. This is the first turn."}
+
+=== AVAILABLE TOOL SCHEMAS ===
+{tools_str}
+
+=== SYMBOLIC RULES ===
+1. Emit every required schema argument. Each scalar/array argument is exactly
+   one of: {{"source":"user","value":...}},
+   {{"source":"history","value":...}}, {{"source":"schema_default"}}, or
+   {{"source":"tool_output","call_id":"earlier_call","path":"declared.path"}}.
+   Omit optional arguments unless the user explicitly requested the behavior;
+   in particular, never enable a boolean flag silently.
+2. A tool_output binding may reference only an earlier call and must use an
+   exact field from that tool's output_schema. Never predict its value. Put the
+   producer in depends_on. Arrays may consume only actual array outputs.
+3. Make every user/history literal visible verbatim in the current/prior user
+   utterances. Opaque IDs/symbols should instead come from a capable lookup.
+4. Include explicit ordering dependencies for authentication, mutation then
+   verification, and user-requested sequencing. Set parallel_group to null.
+5. Do not assert a concrete future result. Later utterances may say “that
+   result”, and their calls should retain symbolic output bindings.
+6. Use only feasible entities/credentials from generator state, and expose any
+   state-derived required value naturally in the user utterance.
+7. Audit exact call count, types, enums, output paths, dependencies and literal
+   visibility before returning JSON.
+8. Map every independently requested user clause to a capable call, and every
+   call to an explicit clause or strictly necessary dependency. Do not mention
+   an action, comparison, or report that this turn's calls cannot complete.
+9. Treat output_schema as authoritative. Do not describe one returned object
+   as a list, and do not promise work on “all results” when a downstream tool
+   accepts only one scalar. Any array-element selection needs an explicit user
+   criterion; never silently choose index zero or substitute unrelated items.
+10. Every requested fact must be present in a selected tool output or be a
+    direct report of a successful mutation. A related call is not sufficient.
+11. Compare every mutation against generator-only state before proposing it.
+    It must have a real effect: do not create an existing entity, delete a
+    missing one, repeat an existing follow/watchlist membership, or set a field
+    to the value it already has.
+12. When REPAIR FEEDBACK reports a failed tool or state action, do not emit the
+    same tool with the same arguments again. Replace it with a state-feasible
+    action that still serves the intent, or rewrite the intent around a
+    different necessary capability.
+13. Preserve entity identity across turns. If the user says "that", "same", or
+    "just created", bind the later identifier directly to the original
+    create/lookup call output. Never replace it with the first result of an
+    unrelated broad list/search call; a verification read must consume the
+    exact identifier already established for that entity.
+
+{domain_hints}
+
+=== GENERATOR-ONLY API STATE (NOT POLICY-VISIBLE) ===
+{initial_state_context or "No mutable state for these tools."}
+{credential_context}
+
+=== OUTPUT ===
+Return only valid JSON shaped like:
+{json.dumps(output_contract, ensure_ascii=False, indent=2)}
+"""
+                if feedback:
+                    prompt += (
+                        "\n=== REPAIR FEEDBACK ===\n"
+                        + feedback
+                        + "\nRepair this turn only; preserve the coherent goal."
+                    )
+                call_schema = {
+                    "type": "object",
+                    "properties": {
+                        "call_id": {"type": "string"},
+                        "tool_name": {
+                            "type": "string",
+                            "enum": sorted(available_names),
+                        },
+                        "arguments": {
+                            "type": "object",
+                            "additionalProperties": True,
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "parallel_group": {"type": "null"},
+                    },
+                    "required": [
+                        "call_id",
+                        "tool_name",
+                        "arguments",
+                        "depends_on",
+                        "parallel_group",
+                    ],
+                    "additionalProperties": False,
+                }
+                turn_schema = {
+                    "type": "object",
+                    "properties": {
+                        "user_query": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "calls": {
+                            "type": "array",
+                            "items": call_schema,
+                            "minItems": required_count,
+                            "maxItems": required_count,
+                        },
+                    },
+                    "required": ["user_query", "intent", "calls"],
+                    "additionalProperties": False,
+                }
+                if turn_index == 1:
+                    response_schema = {
+                        "type": "object",
+                        "properties": {
+                            "overall_task": {"type": "string"},
+                            "future_turn_intents": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": self.num_turns - 1,
+                                "maxItems": self.num_turns - 1,
+                            },
+                            "turn": turn_schema,
+                        },
+                        "required": [
+                            "overall_task",
+                            "future_turn_intents",
+                            "turn",
+                        ],
+                        "additionalProperties": False,
+                    }
+                else:
+                    response_schema = {
+                        "type": "object",
+                        "properties": {"turn": turn_schema},
+                        "required": ["turn"],
+                        "additionalProperties": False,
+                    }
+                response = self._safe_llm_generate(
+                    [{"role": "user", "content": prompt}],
+                    purpose="blueprint_turn_compile",
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": f"symbolic_turn_{turn_index}",
+                            "strict": True,
+                            "schema": response_schema,
+                        },
+                    },
+                )
+                response_text = response.strip()
+                if "```json" in response_text:
+                    response_text = response_text.split("```json", 1)[1].split(
+                        "```", 1
+                    )[0]
+                elif "```" in response_text:
+                    response_text = response_text.split("```", 1)[1].split(
+                        "```", 1
+                    )[0]
+                start = response_text.find("{")
+                end = response_text.rfind("}") + 1
+                try:
+                    parsed = json.loads(response_text[start:end])
+                except (json.JSONDecodeError, ValueError) as exc:
+                    feedback = f"Return valid JSON: {exc}."
+                    if attempt == 0 and attempts > 1:
+                        repair_budget -= 1
+                    continue
+
+                raw_turn = parsed.get("turn")
+                if not isinstance(raw_turn, dict):
+                    feedback = "Output must contain one object named turn."
+                    if attempt == 0 and attempts > 1:
+                        repair_budget -= 1
+                    continue
+                raw_calls = raw_turn.get("calls", [])
+                if not isinstance(raw_calls, list) or len(raw_calls) != required_count:
+                    feedback = (
+                        f"This turn has {len(raw_calls) if isinstance(raw_calls, list) else 0} "
+                        f"calls; return exactly {required_count} calls with the "
+                        "prescribed IDs."
+                    )
+                    if attempt == 0 and attempts > 1:
+                        repair_budget -= 1
+                    continue
+
+                combined, issues = self._normalise_symbolic_blueprint_turns(
+                    [*accepted_turns, raw_turn],
+                    available_tool_names=available_names,
+                )
+                current_tools = (
+                    combined[-1].get("expected_tools", []) if combined else []
+                )
+                missing_current = [
+                    name
+                    for name in required_by_turn[turn_index - 1]
+                    if name not in current_tools
+                ]
+                if missing_current:
+                    issues.append(
+                        "Missing hard tools for this turn: "
+                        + ", ".join(missing_current)
+                    )
+                if not issues:
+                    issues.extend(
+                        self._preflight_symbolic_blueprint_execution(combined)
+                    )
+                if issues:
+                    feedback = "\n".join(issues[:20])
+                    if attempt == 0 and attempts > 1:
+                        repair_budget -= 1
+                    continue
+
+                if turn_index == 1:
+                    proposed_task = str(parsed.get("overall_task", "")).strip()
+                    proposed_intents = parsed.get("future_turn_intents", [])
+                    if (
+                        not proposed_task
+                        or not isinstance(proposed_intents, list)
+                        or len(proposed_intents) != self.num_turns - 1
+                        or not all(str(item).strip() for item in proposed_intents)
+                    ):
+                        feedback = (
+                            "The first-turn output needs a non-empty overall_task "
+                            f"and exactly {self.num_turns - 1} non-empty "
+                            "future_turn_intents."
+                        )
+                        if attempt == 0 and attempts > 1:
+                            repair_budget -= 1
+                        continue
+                    overall_task = proposed_task
+                    future_intents = [
+                        str(item).strip() for item in proposed_intents
+                    ]
+                accepted_turns = combined
+                turn_accepted = True
+                break
+
+            if not turn_accepted:
+                print(
+                    f"  ✗ Turnwise symbolic compiler failed at turn "
+                    f"{turn_index}: {feedback[:500]}"
+                )
+                return None
+
+        return {"overall_task": overall_task, "turns": accepted_turns}
+
+    def _align_symbolic_blueprint_queries(
+        self,
+        *,
+        overall_task: str,
+        turns: List[Dict[str, Any]],
+        tools_json: List[Dict[str, Any]],
+    ) -> Tuple[Optional[str], Optional[List[Dict[str, Any]]], List[str]]:
+        """Rewrite all user utterances once against an immutable call graph.
+
+        Blueprint teachers are much better at compiling a valid symbolic graph
+        when they can concentrate on structure, but their prose can promise
+        more work than that graph performs.  One episode-level pass makes the
+        requests and fixed calls bijective without bringing back a per-turn or
+        per-tool judge.  Python then repeats provenance and execution checks.
+        """
+        if not turns:
+            return None, None, ["Cannot align an empty symbolic episode."]
+
+        used_tool_names = {
+            str(call.get("tool_name", ""))
+            for turn in turns
+            for call in turn.get("calls", [])
+        }
+        used_contracts = [
+            {
+                "name": tool.get("name") or tool.get("api_name"),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("parameters", {}),
+                "output_schema": tool.get("output_schema", {}),
+            }
+            for tool in tools_json
+            if str(tool.get("name") or tool.get("api_name", ""))
+            in used_tool_names
+        ]
+        fixed_plan = [
+            {
+                "turn_number": turn_index,
+                "current_user_query": str(turn.get("user_query", "")),
+                "intent": str(turn.get("intent", "")),
+                "calls": copy.deepcopy(turn.get("calls", [])),
+            }
+            for turn_index, turn in enumerate(turns, 1)
+        ]
+        prompt = f"""Rewrite the user-facing language for one fixed tool-use
+episode. The symbolic calls are immutable: do not add, remove, reorder, rename,
+or redesign them. Return all rewritten turns in one response.
+
+=== CURRENT OVERALL TASK ===
+{overall_task}
+
+=== FIXED SYMBOLIC PLAN ===
+{json.dumps(fixed_plan, ensure_ascii=False, indent=2, default=str)}
+
+=== CONTRACTS FOR USED TOOLS ===
+{json.dumps(used_contracts, ensure_ascii=False, indent=2, default=str)}
+
+=== ALIGNMENT RULES ===
+1. Each user utterance must request exactly the outcomes that its fixed calls
+   can produce: no omitted requested result and no unsupported extra result.
+2. Every fixed call must be motivated by an explicit requested outcome or be a
+   strictly necessary dependency of one. Do not expose dependency mechanics.
+3. Preserve every exact literal carried by a `user` source in that same turn.
+   Preserve every `history` literal in an earlier user turn. Do not invent any
+   literal, identifier, fact, result, calculation, mutation, or constraint.
+4. A `tool_output` source is learned only by executing its producer. Refer to
+   it naturally (for example, “that record” or “the result you found”); never
+   put an internal call ID or predicted output value in user speech.
+5. Make later turns coherent reactions or follow-ups. The user may refer to
+   prior visible results but must not know future or hidden simulator state.
+6. Sound like a real end user stating goals and constraints. Never mention
+   tools, APIs, schemas, function names, call IDs, provenance, benchmarks, or
+   the execution plan. Do not format the request as a numbered checklist.
+7. If several fixed calls repeat a capability for different literal inputs,
+   request every one of those items explicitly. If the graph performs only a
+   subset of a calculation or collection, request only that exact subset.
+8. Keep the task genuinely compound. Do not simplify away supported work, but
+   do not add prose merely to make it sound harder.
+
+Return only JSON with one concise aligned overall task and exactly
+{len(turns)} turn objects in numeric order.
+"""
+        response_schema = {
+            "type": "object",
+            "properties": {
+                "overall_task": {"type": "string"},
+                "turns": {
+                    "type": "array",
+                    "minItems": len(turns),
+                    "maxItems": len(turns),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "turn_number": {"type": "integer"},
+                            "user_query": {"type": "string"},
+                        },
+                        "required": ["turn_number", "user_query"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["overall_task", "turns"],
+            "additionalProperties": False,
+        }
+        try:
+            response = self._safe_llm_generate(
+                [{"role": "user", "content": prompt}],
+                purpose="blueprint_query_align",
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "aligned_episode_queries",
+                        "strict": True,
+                        "schema": response_schema,
+                    },
+                },
+            ).strip()
+            if "```json" in response:
+                response = response.split("```json", 1)[1].split("```", 1)[0]
+            elif "```" in response:
+                response = response.split("```", 1)[1].split("```", 1)[0]
+            start = response.find("{")
+            end = response.rfind("}") + 1
+            parsed = json.loads(response[start:end])
+        except (json.JSONDecodeError, ValueError, KeyError, RuntimeError) as exc:
+            return None, None, [f"Query alignment failed: {exc}"]
+
+        aligned_task = str(parsed.get("overall_task", "")).strip()
+        aligned_items = parsed.get("turns", [])
+        if not aligned_task:
+            return None, None, ["Query alignment returned an empty overall task."]
+        if not isinstance(aligned_items, list) or len(aligned_items) != len(turns):
+            return None, None, [
+                "Query alignment returned the wrong number of turns: "
+                f"expected {len(turns)}, got "
+                f"{len(aligned_items) if isinstance(aligned_items, list) else 0}."
+            ]
+
+        rewritten = copy.deepcopy(turns)
+        errors: List[str] = []
+        import re
+        internal_id_pattern = re.compile(r"\bt\d+c\d+\b", re.IGNORECASE)
+        seen_turn_numbers: set[int] = set()
+        for expected_number, item in enumerate(aligned_items, 1):
+            if not isinstance(item, dict):
+                errors.append(f"Aligned turn {expected_number} is not an object.")
+                continue
+            turn_number = item.get("turn_number")
+            query = str(item.get("user_query", "")).strip()
+            if turn_number != expected_number or turn_number in seen_turn_numbers:
+                errors.append(
+                    f"Aligned turn order is invalid at position {expected_number}."
+                )
+                continue
+            seen_turn_numbers.add(turn_number)
+            if not query:
+                errors.append(f"Aligned turn {expected_number} is empty.")
+                continue
+            if internal_id_pattern.search(query):
+                errors.append(
+                    f"Aligned turn {expected_number} exposes an internal call ID."
+                )
+                continue
+            rewritten[expected_number - 1]["user_query"] = query
+
+        if errors:
+            return None, None, errors
+        available_names = {
+            str(tool.get("name") or tool.get("api_name", ""))
+            for tool in tools_json
+            if tool.get("name") or tool.get("api_name")
+        }
+        canonical, normalisation_errors = self._normalise_symbolic_blueprint_turns(
+            rewritten,
+            available_tool_names=available_names,
+        )
+        errors.extend(normalisation_errors)
+        if not errors:
+            errors.extend(self._preflight_symbolic_blueprint_execution(canonical))
+        if errors:
+            return None, None, errors
+        return aligned_task, canonical, []
 
     def _stage0_generate_blueprint(
             self, focus_category: Optional[str] = None, initial_api_state: Optional[Dict[str, Any]] = None
@@ -1923,6 +3572,16 @@ If ALL turns are achievable with their selected tools, set is_valid to true with
 
         max_tools_per_turn = self.blueprint_max_actions_per_turn
         exact_action_schedule = self.blueprint_actions_per_turn
+        turnwise_symbolic = bool(
+            self.symbolic_episode_plan
+            and exact_action_schedule
+            and max(exact_action_schedule) >= max(
+                1,
+                int(os.getenv("APIGEN_SYMBOLIC_TURNWISE_MIN_WIDTH", "5")),
+            )
+            and os.getenv("APIGEN_SYMBOLIC_TURNWISE", "1").strip().casefold()
+            not in {"0", "false", "no", "off"}
+        )
         if exact_action_schedule is None:
             action_schedule_requirement = (
                 f"Use 1-{max_tools_per_turn} expected tools per turn, varying "
@@ -2062,12 +3721,180 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
 === OUTPUT ===
 {{"overall_task": "scenario", "turns": [{{"user_query": "request", "expected_tools": ["t1", "t2"]}}, ...]}}"""
 
+        if self.symbolic_episode_plan:
+            max_total_calls = (
+                self.blueprint_max_total_actions
+                if self.blueprint_max_total_actions is not None
+                else self.num_turns * max_tools_per_turn
+            )
+            min_total_calls = min(
+                max_total_calls,
+                (
+                    self.blueprint_min_total_actions
+                    if self.blueprint_min_total_actions is not None
+                    else max(self.num_turns, self.num_turns * 2)
+                ),
+            )
+            # A broad "roughly 15-20" instruction encouraged teachers to
+            # return 21 calls and forced a complete paid regeneration.  Sample
+            # one concrete in-range target for this episode; validation still
+            # enforces the configured inclusive bounds, so this improves yield
+            # without weakening the complexity floor.
+            if exact_action_schedule is not None:
+                target_total_calls = sum(exact_action_schedule)
+                symbolic_schedule_requirement = (
+                    "Use exactly this calls-array length by turn: "
+                    + ", ".join(
+                        f"turn {index + 1}={count}"
+                        for index, count in enumerate(exact_action_schedule)
+                    )
+                    + "."
+                )
+            else:
+                target_total_calls = random.randint(
+                    min_total_calls,
+                    max_total_calls,
+                )
+                symbolic_schedule_requirement = (
+                    f"Use 1-{max_tools_per_turn} calls in each turn."
+                )
+            prompt = f"""Design one coherent, executable {self.num_turns}-turn
+tool-use conversation and compile its complete symbolic call graph in the SAME
+response.
+
+=== AVAILABLE TOOLS ===
+{tools_str}
+{directive_section}
+
+=== GOAL ===
+Create a realistic task with exactly {target_total_calls} necessary calls across
+the episode. {symbolic_schedule_requirement} Count the `calls` array items in
+every turn and across the episode before returning JSON. The inclusive
+{min_total_calls}-{max_total_calls} range remains a hard validity constraint;
+never add filler merely to hit the sampled target.
+For any turn assigned five or more calls, deliberately write one natural
+compound request with several related deliverables and constraints. Build the
+required call graph first, then phrase the user request so that every scheduled
+call is explicitly motivated. It is fine to invoke the same capability for
+different user-requested items, but never return fewer calls than the exact
+schedule and never invent an unrelated check merely to fill a slot.
+Prefer genuine discovery → action → verification workflows, state changes that
+are used later, and follow-ups whose resolution depends on prior visible tool
+results. When the supplied tools permit it, include at least two tool-output
+bindings and at least one binding across user turns.
+
+=== USER-LANGUAGE RULES ===
+1. Write natural end-user utterances, not API instructions, argument dumps,
+   numbered plans, benchmark prose, or requests for internal IDs.
+2. The user states goals, constraints and values they plausibly know. If a
+   lookup can discover an opaque ID/token/symbol, call the lookup and bind the
+   later argument to its output instead of putting that opaque value in speech.
+3. Each later turn must be a plausible reaction or follow-up to the prior
+   visible conversation. Do not make every turn an unrelated new task. Never
+   pre-write a concrete price, ID, status, balance, search result or other value
+   that only a future tool execution could reveal; say "that option/result"
+   and retain a symbolic tool_output binding instead.
+4. Include every literal required by a call naturally in the current or an
+   earlier user utterance unless it comes from an earlier call or schema default.
+5. The generator-only state appended below is NOT visible to the solving model.
+   Never source an argument silently from it.
+6. Existing-entity and authentication calls must be simulator-feasible. Use an
+   exact valid credential/entity value from generator state only after writing
+   it naturally into the user utterance. If an available lookup can translate a
+   natural name into the required opaque ID, use that lookup first and bind its
+   output; never pass a display name where an ID is required.
+
+=== SYMBOLIC EXECUTION CONTRACT ===
+1. Use globally unique call IDs: t1c1, t1c2, ..., t2c1, and so on.
+2. Emit every required argument and no argument forbidden by the schema.
+3. Each argument must use exactly one provenance form:
+   - {{"source":"user","value":...}} when the exact value is visible in this
+     turn's utterance;
+   - {{"source":"history","value":...}} when the exact value is visible in an
+     earlier USER utterance (not merely in generator state or a predicted tool
+     response);
+   - {{"source":"schema_default"}} only if the schema declares a default;
+   - {{"source":"tool_output","call_id":"t1c1","path":"field.subfield"}}
+     when an earlier call returns it.
+   For every ARRAY parameter, always wrap the complete array in one source
+   object, for example {{"source":"user","value":["#one","#two"]}} or
+   {{"source":"schema_default"}}; never emit a raw array, an `items` wrapper,
+   or per-element provenance. For OBJECT parameters, either wrap the complete
+   object in one source or preserve its JSON shape and put a source object at
+   every scalar leaf (for example updates.priority). Never leave a leaf
+   unbound.
+4. Never predict or copy a future concrete tool output. A tool_output binding
+   contains call_id and path only, never a guessed value.
+5. A call may depend only on a call listed earlier in the episode. Use the exact
+   output_schema field name and place all referenced call IDs in depends_on.
+   Also include semantic ordering prerequisites even when no value is passed:
+   authenticate -> protected operation, mutation -> verification read, and any
+   explicit "then/after" ordering in the user request. Do not rely on array
+   order alone to express these prerequisites.
+6. This V2 plan is sequential: set parallel_group to null for every call.
+7. Every call must be necessary for the user-visible goal. Prefer multi-hop
+   dependencies and meaningful mutations/read-after-write over independent
+   trivia, but do not claim results absent from tool outputs.
+8. Authentication persists. Authenticate only before the first protected call.
+9. Dates must be on or after {datetime.now(timezone.utc).date().isoformat()}.
+10. Privately audit schema types, enums, state feasibility, argument provenance,
+    output paths and dependency order before returning JSON.
+11. For user/history bindings, make the exact scalar spelling visible somewhere
+    in the current/prior user utterances, including enum tokens, units, dates,
+    filenames and IDs. Natural surrounding prose is encouraged; hidden aliases
+    are not.
+12. Before returning, map every call occurrence to an explicit user request or
+    a strictly necessary dependency, and map every user request to a capable
+    call. Delete unrequested status/time/lookups and add the actually required
+    capability instead. Never pad the graph to reach the target count.
+13. Preserve entity identity across turns. A later reference to "that",
+    "same", or "just created" must bind directly to the original create/lookup
+    output. Never silently substitute the first item from a broad list/search
+    call; use the established identifier for all later reads and mutations.
+
+=== OUTPUT ===
+Return ONLY valid JSON with exactly {self.num_turns} turns:
+{{
+  "overall_task": "one concise user-facing scenario",
+  "turns": [
+    {{
+      "user_query": "natural request",
+      "intent": "short semantic intent",
+      "calls": [
+        {{
+          "call_id": "t1c1",
+          "tool_name": "exact_tool_name",
+          "arguments": {{
+            "argument_name": {{"source":"user","value":"exact visible value"}}
+          }},
+          "depends_on": [],
+          "parallel_group": null
+        }}
+      ]
+    }}
+  ]
+}}
+"""
+
         if focus_category and not allowed_tools:
             prompt += f"\n\nAll available tools below are from the '{focus_category}' category."
 
-            domain_hints = get_domain_hints(focus_category)
-            if domain_hints:
-                prompt += f"\n\n{domain_hints}"
+        selected_categories = sorted(
+            {
+                str(tool.get("category", ""))
+                for tool in tools_json
+                if tool.get("category")
+            }
+        )
+        combined_domain_hints = "\n".join(
+            hint
+            for hint in (
+                get_domain_hints(category) for category in selected_categories
+            )
+            if hint
+        )
+        if combined_domain_hints:
+            prompt += f"\n\n{combined_domain_hints}"
 
         if initial_state_context:
             prompt += (
@@ -2086,6 +3913,87 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                 f"{credential_context}"
             )
 
+        symbolic_response_format: Optional[Dict[str, Any]] = None
+        if self.symbolic_episode_plan and not turnwise_symbolic:
+            available_names = sorted(
+                {
+                    str(tool.get("name") or tool.get("api_name", ""))
+                    for tool in tools_json
+                    if tool.get("name") or tool.get("api_name")
+                }
+            )
+            minimum_turn_calls = (
+                min(exact_action_schedule) if exact_action_schedule else 1
+            )
+            maximum_turn_calls = (
+                max(exact_action_schedule)
+                if exact_action_schedule
+                else max_tools_per_turn
+            )
+            call_schema = {
+                "type": "object",
+                "properties": {
+                    "call_id": {
+                        "type": "string",
+                        "pattern": r"^t[1-9][0-9]*c[1-9][0-9]*$",
+                    },
+                    "tool_name": {"type": "string", "enum": available_names},
+                    "arguments": {
+                        "type": "object",
+                        "additionalProperties": True,
+                    },
+                    "depends_on": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "parallel_group": {"type": "null"},
+                },
+                "required": [
+                    "call_id",
+                    "tool_name",
+                    "arguments",
+                    "depends_on",
+                    "parallel_group",
+                ],
+                "additionalProperties": False,
+            }
+            turn_schema = {
+                "type": "object",
+                "properties": {
+                    "user_query": {"type": "string"},
+                    "intent": {"type": "string"},
+                    "calls": {
+                        "type": "array",
+                        "items": call_schema,
+                        "minItems": minimum_turn_calls,
+                        "maxItems": maximum_turn_calls,
+                    },
+                },
+                "required": ["user_query", "intent", "calls"],
+                "additionalProperties": False,
+            }
+            symbolic_response_format = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "symbolic_episode_blueprint",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "overall_task": {"type": "string"},
+                            "turns": {
+                                "type": "array",
+                                "items": turn_schema,
+                                "minItems": self.num_turns,
+                                "maxItems": self.num_turns,
+                            },
+                        },
+                        "required": ["overall_task", "turns"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+
         accumulated_feedback = ""
         max_blueprint_attempts = max(
             1,
@@ -2094,17 +4002,46 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                 int(os.getenv("APIGEN_MAX_BLUEPRINT_ATTEMPTS", "2")),
             ),
         )
+        if turnwise_symbolic:
+            # Turnwise compilation already owns its bounded repair budget.
+            max_blueprint_attempts = 1
         for attempt in range(max_blueprint_attempts):
             try:
-                if accumulated_feedback:
+                if turnwise_symbolic:
+                    turnwise_result = self._generate_symbolic_blueprint_turnwise(
+                        tools_json=tools_json,
+                        directive=directive,
+                        exact_action_schedule=exact_action_schedule,
+                        focus_category=focus_category,
+                        initial_state_context=initial_state_context,
+                        credential_context=credential_context,
+                    )
+                    if turnwise_result is None:
+                        continue
+                    response = json.dumps(
+                        turnwise_result, ensure_ascii=False, default=str
+                    )
+                elif accumulated_feedback:
                     prompt_with_feedback = prompt + f"\n\n=== PREVIOUS ATTEMPT FEEDBACK ===\n{accumulated_feedback}\n=== END FEEDBACK ===\n"
+                    response = self._safe_llm_generate(
+                        [{"role": "user", "content": prompt_with_feedback}],
+                        purpose="blueprint_generate",
+                        **(
+                            {"response_format": symbolic_response_format}
+                            if symbolic_response_format
+                            else {}
+                        ),
+                    )
                 else:
-                    prompt_with_feedback = prompt
-
-                response = self._safe_llm_generate(
-                    [{"role": "user", "content": prompt_with_feedback}],
-                    purpose="blueprint_generate",
-                )
+                    response = self._safe_llm_generate(
+                        [{"role": "user", "content": prompt}],
+                        purpose="blueprint_generate",
+                        **(
+                            {"response_format": symbolic_response_format}
+                            if symbolic_response_format
+                            else {}
+                        ),
+                    )
                 response_text = response.strip()
 
                 if "```json" in response_text:
@@ -2123,13 +4060,81 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                     print(f"  ✗ {accumulated_feedback}")
                     continue
 
+                if self.symbolic_episode_plan:
+                    turns, symbolic_errors = (
+                        self._normalise_symbolic_blueprint_turns(
+                            turns,
+                            available_tool_names={
+                                str(
+                                    tool.get("name")
+                                    or tool.get("api_name", "")
+                                )
+                                for tool in tools_json
+                                if tool.get("name") or tool.get("api_name")
+                            },
+                        )
+                    )
+                    actual_total_calls = sum(
+                        len(turn.get("calls", [])) for turn in turns
+                    )
+                    if exact_action_schedule is not None:
+                        for turn_index, (turn, required_count) in enumerate(
+                            zip(turns, exact_action_schedule),
+                            start=1,
+                        ):
+                            actual_count = len(turn.get("calls", []))
+                            if actual_count != required_count:
+                                symbolic_errors.append(
+                                    f"Turn {turn_index} has {actual_count} "
+                                    f"calls; exactly {required_count} required."
+                                )
+                    configured_minimum = (
+                        self.blueprint_min_total_actions
+                        if self.blueprint_min_total_actions is not None
+                        else min(
+                            self.num_turns
+                            * self.blueprint_max_actions_per_turn,
+                            self.num_turns * 2,
+                        )
+                    )
+                    if actual_total_calls < configured_minimum:
+                        symbolic_errors.append(
+                            f"Episode has {actual_total_calls} necessary calls; "
+                            f"minimum is {configured_minimum}. Build a more "
+                            "substantive coherent workflow without filler."
+                        )
+                    configured_maximum = (
+                        self.blueprint_max_total_actions
+                        if self.blueprint_max_total_actions is not None
+                        else self.num_turns
+                        * self.blueprint_max_actions_per_turn
+                    )
+                    if actual_total_calls > configured_maximum:
+                        symbolic_errors.append(
+                            f"Episode has {actual_total_calls} calls; maximum "
+                            f"is {configured_maximum}. Remove unnecessary work."
+                        )
+                    if symbolic_errors:
+                        accumulated_feedback = (
+                            "Symbolic plan validation failed:\n"
+                            + "\n".join(symbolic_errors[:20])
+                            + "\nRegenerate the complete episode plan; do not "
+                            "guess hidden values or future outputs."
+                        )
+                        print(f"  ✗ {accumulated_feedback[:1000]}")
+                        continue
+                    result["turns"] = turns
+
                 validation_errors = []
                 all_tools_valid = True
                 for i, t in enumerate(turns):
                     expected = t.get("expected_tools", [])
                     required_count = (
                         exact_action_schedule[i]
-                        if exact_action_schedule is not None
+                        if (
+                            exact_action_schedule is not None
+                            and not self.symbolic_episode_plan
+                        )
                         else None
                     )
                     count_is_valid = (
@@ -2172,7 +4177,9 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                         if not all_tools_valid:
                             break
 
-                    # Validate placeholder references in user_query
+                    # Validate legacy placeholder references in user_query.
+                    # V2 carries executable call-id/path bindings outside the
+                    # natural utterance and therefore needs no template token.
                     query = t.get("user_query", "")
                     import re
                     placeholders = re.findall(
@@ -2223,7 +4230,8 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                     if not all_tools_valid:
                         break
 
-                # Validate cross-turn entity references
+                # Validate legacy cross-turn entity references.  V2 validates
+                # these directly in the symbolic dependency graph above.
                 cross_turn_entity_tools = {
                     'comment': ('tweet_id', 'post_tweet'),
                     'retweet': ('tweet_id', 'post_tweet'),
@@ -2235,6 +4243,8 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                     'purchase_insurance': ('booking_id', 'book_flight'),
                 }
                 for i, t in enumerate(turns):
+                    if self.symbolic_episode_plan:
+                        break
                     if i == 0:
                         continue
                     expected = t.get("expected_tools", [])
@@ -2299,7 +4309,60 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                     print(f"  ✗ {accumulated_feedback}")
                     continue
 
-                # Verify tool capabilities match query intents
+                # Deterministic entity validation for PostingApi
+                entity_issues = self._validate_posting_api_entities(turns, initial_api_state)
+                if entity_issues:
+                    entity_feedback = "\n".join(entity_issues)
+                    accumulated_feedback = f"Entity reference errors:\n{entity_feedback}\n\nPlease regenerate with valid entity references from the API state."
+                    print(f"  ✗ {accumulated_feedback[:200]}...")
+                    continue
+
+                # Deterministic entity validation for VehicleControl
+                vehicle_issues = self._validate_vehicle_control_queries(turns, initial_api_state)
+                if vehicle_issues:
+                    vehicle_feedback = "\n".join(vehicle_issues)
+                    accumulated_feedback = f"Vehicle state errors:\n{vehicle_feedback}\n\nPlease regenerate with coherent vehicle state."
+                    print(f"  ✗ {accumulated_feedback[:200]}...")
+                    continue
+
+                if self.symbolic_episode_plan:
+                    execution_issues = (
+                        self._preflight_symbolic_blueprint_execution(turns)
+                    )
+                    if execution_issues:
+                        execution_feedback = "\n".join(execution_issues)
+                        accumulated_feedback = (
+                            "Deterministic execution preflight failed:\n"
+                            f"{execution_feedback}\n\nRepair the symbolic binding "
+                            "or state-dependent action while preserving the "
+                            "same coherent user goal."
+                        )
+                        print(f"  ✗ {accumulated_feedback[:500]}...")
+                        continue
+
+                    aligned_task, aligned_turns, alignment_issues = (
+                        self._align_symbolic_blueprint_queries(
+                            overall_task=str(result.get("overall_task", "")),
+                            turns=turns,
+                            tools_json=tools_json,
+                        )
+                    )
+                    if alignment_issues or aligned_turns is None:
+                        alignment_feedback = "\n".join(alignment_issues)
+                        accumulated_feedback = (
+                            "Episode query/call alignment failed:\n"
+                            f"{alignment_feedback}\n\nRegenerate a call graph whose "
+                            "exact supported work can be stated naturally."
+                        )
+                        print(f"  ✗ {accumulated_feedback[:500]}...")
+                        continue
+                    turns = aligned_turns
+                    result["turns"] = turns
+                    result["overall_task"] = aligned_task
+
+                # Run the only semantic judge after every deterministic gate,
+                # so malformed or simulator-infeasible plans consume no judge
+                # request and can use the bounded Stage-0 repair attempt.
                 print(f"  Verifying tool-query capability match...")
                 cap_valid, cap_issues = self._verify_blueprint_capabilities(
                     turns, focus_category, initial_api_state
@@ -2316,22 +4379,6 @@ blueprint. Integrate them into one coherent user goal; never add a filler call.
                     "episode_level": True,
                     "turn_count": len(turns),
                 }
-
-                # Deterministic entity validation for PostingApi
-                entity_issues = self._validate_posting_api_entities(turns, initial_api_state)
-                if entity_issues:
-                    entity_feedback = "\n".join(entity_issues)
-                    accumulated_feedback = f"Entity reference errors:\n{entity_feedback}\n\nPlease regenerate with valid entity references from the API state."
-                    print(f"  ✗ {accumulated_feedback[:200]}...")
-                    continue
-
-                # Deterministic entity validation for VehicleControl
-                vehicle_issues = self._validate_vehicle_control_queries(turns, initial_api_state)
-                if vehicle_issues:
-                    vehicle_feedback = "\n".join(vehicle_issues)
-                    accumulated_feedback = f"Vehicle state errors:\n{vehicle_feedback}\n\nPlease regenerate with coherent vehicle state."
-                    print(f"  ✗ {accumulated_feedback[:200]}...")
-                    continue
 
                 print(f" ✓ Blueprint generated: {result.get('overall_task', '')[:100]}")
                 return DialogBlueprint(
@@ -2499,7 +4546,7 @@ Return only JSON: {{"query": "..."}}
 
         query_result = QueryGenerationResult(
             query=user_query,
-            intent="",
+            intent=str(turn_spec.get("intent", "")),
             expected_tools=expected_tools,
         )
         current_state = (
@@ -2860,10 +4907,29 @@ Return only JSON: {{"query": "..."}}
 
         prior_tc_by_name = {}
         for turn_out in turn_outputs:
+            if not isinstance(turn_out, dict):
+                continue
+            calls = turn_out.get("calls")
+            if isinstance(calls, list):
+                for call in calls:
+                    if not isinstance(call, dict):
+                        continue
+                    tool_name = str(call.get("tool_name", ""))
+                    output = call.get("output")
+                    if tool_name and isinstance(output, dict):
+                        prior_tc_by_name.setdefault(tool_name, []).append(
+                            output
+                        )
+                continue
+            # Compatibility with checkpoints written before call-preserving
+            # turn aggregates were introduced.
             for tool_name, output in turn_out.items():
-                if tool_name not in prior_tc_by_name:
-                    prior_tc_by_name[tool_name] = []
-                prior_tc_by_name[tool_name].append(output)
+                if tool_name in {"calls", "by_tool"}:
+                    continue
+                outputs = output if isinstance(output, list) else [output]
+                for item in outputs:
+                    if isinstance(item, dict):
+                        prior_tc_by_name.setdefault(tool_name, []).append(item)
 
         if 'book_flight' in current_tc_by_name:
             bf_args = current_tc_by_name['book_flight'].arguments or {}

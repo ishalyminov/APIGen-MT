@@ -128,6 +128,12 @@ def test_new_travel_catalog_and_session_tools():
     assert airports["count"] >= 80
     assert {"city": "San Francisco", "code": "SFO"} in airports["airports"]
 
+    pool_by_name = {row["api_name"]: row for row in _rows(POOL)}
+    card_items = pool_by_name["get_all_credit_cards"]["output_schema"][
+        "properties"
+    ]["cards"]["items"]
+    assert "card_id" in card_items["properties"]
+
 
 def test_new_vehicle_read_and_brake_tools_are_deterministic():
     vehicle = VehicleControl({

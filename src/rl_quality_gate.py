@@ -25,6 +25,7 @@ MUTATING_TOOLS = frozenset(
         "mention",
         "post_tweet",
         "trading_login",
+        "trading_logout",
         "add_to_watchlist",
         "remove_stock_from_watchlist",
         "place_order",
@@ -39,6 +40,7 @@ MUTATING_TOOLS = frozenset(
         "send_message",
         "delete_message",
         "ticket_login",
+        "logout",
         "create_ticket",
         "edit_ticket",
         "resolve_ticket",
@@ -62,8 +64,10 @@ MUTATING_TOOLS = frozenset(
         "setHeadlights",
         "lockDoors",
         "pressBrakePedal",
+        "releaseBrakePedal",
         "activateParkingBrake",
         "adjustClimateControl",
+        "update_market_status",
     }
 )
 

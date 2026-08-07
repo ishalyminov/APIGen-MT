@@ -15,8 +15,16 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-def field(type_name: str, description: str) -> Dict[str, Any]:
-    return {"type": type_name, "description": description}
+def field(
+    type_name: str,
+    description: str,
+    **schema_details: Any,
+) -> Dict[str, Any]:
+    return {
+        "type": type_name,
+        "description": description,
+        **schema_details,
+    }
 
 
 def obj(**properties: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,6 +39,7 @@ OUTPUT_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "list_users": obj(workspace_id=field("string", "Workspace ID."), user_count=field("integer", "Number of users."), users=field("array", "Users with names and user IDs.")),
     "message_get_login_status": obj(logged_in=field("boolean", "Whether a user is logged in."), current_user=field("string", "Current user ID.")),
     "view_messages_sent": obj(logged_in=field("boolean", "Whether a user is logged in."), current_user=field("string", "Current user ID."), message_count=field("integer", "Sent message count."), messages=field("array", "Messages sent by the current user.")),
+    "search_messages": obj(results=field("array", "Matching sent and received messages.", items=obj(message=field("string", "Message text."), direction=field("string", "Whether the message was sent or received.")))),
     "list_all_following": obj(authenticated=field("boolean", "Whether the posting user is authenticated."), following_count=field("integer", "Number of followed users."), following=field("array", "Followed usernames.")),
     "posting_get_login_status": obj(logged_in=field("boolean", "Whether the posting user is logged in."), username=field("string", "Authenticated username.")),
     "logout": obj(success=field("boolean", "Whether a ticket user was logged out."), username=field("string", "Logged-out username.")),
@@ -41,7 +50,7 @@ OUTPUT_SCHEMAS: Dict[str, Dict[str, Any]] = {
     "get_watchlist": obj(authenticated=field("boolean", "Whether the trading user is authenticated."), count=field("integer", "Watchlist size."), watchlist=field("array", "Stock symbols in the watchlist.")),
     "trading_get_login_status": obj(logged_in=field("boolean", "Whether the trading user is logged in."), username=field("string", "Authenticated username.")),
     "trading_logout": obj(success=field("boolean", "Whether a trading user was logged out."), username=field("string", "Logged-out username.")),
-    "get_all_credit_cards": obj(logged_in=field("boolean", "Whether a travel session is active."), count=field("integer", "Number of registered cards."), cards=field("array", "Masked registered-card details.")),
+    "get_all_credit_cards": obj(logged_in=field("boolean", "Whether a travel session is active."), count=field("integer", "Number of registered cards."), cards=field("array", "Masked registered-card details.", items=obj(card_id=field("string", "Registered card ID."), card_number_masked=field("string", "Masked card number."), expiration_date=field("string", "Card expiration date."), cardholder_name=field("string", "Cardholder name."), balance=field("number", "Available card balance.")))),
     "list_all_airports": obj(count=field("integer", "Number of airports."), airports=field("array", "City and airport-code pairs.")),
     "travel_get_login_status": obj(logged_in=field("boolean", "Whether a travel session is active."), user_first_name=field("string", "Traveler first name."), user_last_name=field("string", "Traveler last name."), token_type=field("string", "Token type."), scope=field("string", "Token scope."), expires_in=field("integer", "Token lifetime in seconds.")),
     "activateParkingBrake": obj(parkingBrakeStatus=field("string", "Parking-brake status."), _parkingBrakeForce=field("number", "Parking-brake force."), _slopeAngle=field("number", "Road slope angle.")),
@@ -94,7 +103,11 @@ def main() -> None:
             "output_description",
             f"Structured deterministic result returned by {api_name}.",
         )
-        schema = old.get("output_schema") or OUTPUT_SCHEMAS.get(api_name)
+        # Explicit schemas describe the deterministic implementations in this
+        # repository and must win on subsequent idempotent rebuilds.  Otherwise
+        # an older shallow array schema is copied forever and teachers bind an
+        # object (``cards.0``) where a scalar ID (``cards.0.card_id``) is needed.
+        schema = OUTPUT_SCHEMAS.get(api_name) or old.get("output_schema")
         if schema is None:
             raise RuntimeError(f"No output schema available for {api_name}")
         row["output_schema"] = schema
