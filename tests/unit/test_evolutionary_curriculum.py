@@ -183,3 +183,40 @@ def test_openrouter_provider_is_pinned_without_fallbacks(monkeypatch):
         "allow_fallbacks": False,
         "require_parameters": True,
     }
+
+
+def test_openrouter_provider_ignore_keeps_auto_routing(monkeypatch):
+    class CapturingLLM:
+        apigen_openrouter_extensions = True
+
+        def get_usage(self):
+            return {
+                "total_calls": 0,
+                "total_attempts": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            }
+
+        def generate(self, messages, **kwargs):
+            self.kwargs = kwargs
+            return "ok"
+
+    client = CapturingLLM()
+    generator = object.__new__(MultiTurnGenerator)
+    generator.llm = client
+    generator.max_calls_per_candidate = 10
+    generator.max_tokens_per_candidate = 100_000
+    generator._initial_token_usage = None
+    generator._accumulated_llm_calls = 0
+    monkeypatch.delenv("APIGEN_OPENROUTER_PROVIDER", raising=False)
+    monkeypatch.setenv(
+        "APIGEN_OPENROUTER_IGNORE_PROVIDERS",
+        "DeepInfra, Inceptron,Cloudflare",
+    )
+
+    assert generator._safe_llm_generate([{"role": "user", "content": "x"}]) == "ok"
+    assert client.kwargs["provider"] == {
+        "ignore": ["DeepInfra", "Inceptron", "Cloudflare"],
+        "require_parameters": True,
+    }

@@ -1310,6 +1310,8 @@ Return ONLY one JSON object with exactly one item per supplied turn:
         self,
         evidence: List[Dict[str, Any]],
         responses: Dict[int, str],
+        *,
+        retry_on_unavailable: bool = True,
     ) -> Dict[int, Dict[str, Any]]:
         """Ground every generated turn response in one fail-closed judge call."""
         allowed_codes = {
@@ -1426,6 +1428,13 @@ Return ONLY JSON with exactly one item per turn:
             return quality_by_turn
         except Exception as exc:
             print(f"    Warning: batched turn-response judge failed: {exc}")
+            if retry_on_unavailable:
+                print("    Retrying batched turn-response judge once")
+                return self._verify_batched_turn_responses(
+                    evidence,
+                    responses,
+                    retry_on_unavailable=False,
+                )
             return {
                 int(item["turn_number"]): {
                     "passed": False,
@@ -1522,22 +1531,29 @@ Return ONLY JSON with exactly one item per turn:
         ]
         try:
             responses = self._generate_batched_turn_responses(evidence)
-        except Exception as exc:
-            print(f"    Error generating batched turn responses: {exc}")
-            for turn in deferred_turns:
-                quality = {
-                    "passed": False,
-                    "issue_codes": ["OTHER_INVALID"],
-                    "validator": "batched_turn_response_writer",
-                    "generated_by_llm": True,
-                    "deferred": False,
-                    "response_required": True,
-                }
-                turn.quality_verification[
-                    "final_response_grounding"
-                ] = quality
-                turn.quality_verification["passed"] = False
-            return False
+        except Exception as first_exc:
+            print(
+                "    Warning: batched turn-response writer failed; "
+                f"retrying once: {first_exc}"
+            )
+            try:
+                responses = self._generate_batched_turn_responses(evidence)
+            except Exception as exc:
+                print(f"    Error generating batched turn responses: {exc}")
+                for turn in deferred_turns:
+                    quality = {
+                        "passed": False,
+                        "issue_codes": ["OTHER_INVALID"],
+                        "validator": "batched_turn_response_writer",
+                        "generated_by_llm": True,
+                        "deferred": False,
+                        "response_required": True,
+                    }
+                    turn.quality_verification[
+                        "final_response_grounding"
+                    ] = quality
+                    turn.quality_verification["passed"] = False
+                return False
 
         qualities = self._verify_batched_turn_responses(evidence, responses)
         all_passed = True
@@ -2789,6 +2805,10 @@ wording, redundancy, or a natural semantic equivalent of an explicit argument
 singular/plural or unit wording while the fixed argument uses the schema's
 canonical enum token. If every requested outcome is supported and every call
 is necessary, mark the episode valid even when the phrasing is not elegant.
+The assistant may summarize, report, compare, or confirm facts directly from
+the selected tool outputs. Those ordinary response acts do not require a
+separate summarization/reporting tool; reject them only when they require an
+uncalled lookup, calculation, aggregation, or unsupported fact.
 
 For each turn, verify:
 1. Does the user_query ask for something the selected tool can actually do?

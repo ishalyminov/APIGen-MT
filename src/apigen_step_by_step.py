@@ -334,15 +334,34 @@ class StepByStepGenerator:
         provider_slug = os.getenv(
             "APIGEN_OPENROUTER_PROVIDER", ""
         ).strip()
-        if allow_openrouter_extensions and provider_slug and "provider" not in kwargs:
+        ignored_providers = [
+            provider.strip()
+            for provider in os.getenv(
+                "APIGEN_OPENROUTER_IGNORE_PROVIDERS", ""
+            ).split(",")
+            if provider.strip()
+        ]
+        if (
+            allow_openrouter_extensions
+            and (provider_slug or ignored_providers)
+            and "provider" not in kwargs
+        ):
             allow_fallbacks = os.getenv(
                 "APIGEN_OPENROUTER_ALLOW_FALLBACKS", "false"
             ).strip().casefold() in {"1", "true", "yes", "on"}
-            kwargs["provider"] = {
-                "only": [provider_slug],
-                "allow_fallbacks": allow_fallbacks,
+            provider_routing = {
                 "require_parameters": True,
             }
+            if provider_slug:
+                provider_routing.update(
+                    {
+                        "only": [provider_slug],
+                        "allow_fallbacks": allow_fallbacks,
+                    }
+                )
+            if ignored_providers:
+                provider_routing["ignore"] = ignored_providers
+            kwargs["provider"] = provider_routing
         import random as _rng
         for attempt in range(max_retries):
             try:

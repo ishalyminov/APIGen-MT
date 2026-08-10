@@ -27,8 +27,52 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def trajectory_view(row: dict[str, Any]) -> dict[str, Any]:
+    """Return one display shape for both legacy and batched-turn rows."""
+
+    trajectory = row.get("trajectory")
+    if isinstance(trajectory, dict):
+        turns = trajectory.get("turns")
+        if not isinstance(turns, list):
+            turns = [
+                {
+                    "turn_number": 1,
+                    "user_query": trajectory.get("query", ""),
+                    "query_intent": trajectory.get("query_intent", ""),
+                    "steps": trajectory.get("steps", []),
+                    "assistant_response": trajectory.get("final_response", ""),
+                }
+            ]
+        return {
+            **trajectory,
+            "query": trajectory.get("query", ""),
+            "turns": turns,
+        }
+
+    conversation = row.get("conversation")
+    if not isinstance(conversation, dict):
+        return {"query": "", "turns": [], "steps": []}
+    turns = conversation.get("turns") or []
+    return {
+        "query": conversation.get("overall_task", ""),
+        "query_intent": conversation.get("overall_task", ""),
+        "categories_used": conversation.get("categories_used", []),
+        "tools_used": conversation.get("tools_used", []),
+        "initial_api_state": conversation.get("initial_api_state", {}),
+        "turns": turns,
+        "steps": [
+            step
+            for turn in turns
+            for step in (turn.get("steps") or [])
+        ],
+        "final_response": (
+            turns[-1].get("assistant_response", "") if turns else ""
+        ),
+    }
+
+
 def first_call(row: dict[str, Any]) -> dict[str, Any]:
-    steps = row.get("trajectory", {}).get("steps", [])
+    steps = trajectory_view(row).get("steps", [])
     if not steps:
         return {}
     calls = steps[0].get("tool_calls", [])
@@ -37,7 +81,7 @@ def first_call(row: dict[str, Any]) -> dict[str, Any]:
 
 def semantic_signature(row: dict[str, Any]) -> str:
     calls: list[dict[str, Any]] = []
-    for step in row.get("trajectory", {}).get("steps", []):
+    for step in trajectory_view(row).get("steps", []):
         for call in step.get("tool_calls", []):
             calls.append(
                 {
@@ -55,7 +99,14 @@ def normalise_text(value: Any) -> str:
 
 def grounding_hints(row: dict[str, Any]) -> list[str]:
     """Conservative hints for first-call string values missing from the query."""
-    query = normalise_text(row.get("trajectory", {}).get("query", ""))
+    trajectory = trajectory_view(row)
+    query = normalise_text(
+        "\n".join(
+            str(turn.get("user_query") or "")
+            for turn in trajectory.get("turns", [])
+        )
+        or trajectory.get("query", "")
+    )
     hints: list[str] = []
     arguments = first_call(row).get("arguments", {})
     for key, value in arguments.items():
@@ -84,11 +135,19 @@ def event_summary(
     failed = [event for event in events if not event.get("matched")]
     matched = [event for event in events if event.get("matched")]
     samples = _group_by(events, lambda event: event.get("sample_index"))
-    successful_samples = sum(
-        len(sample_events) == num_gold_calls
-        and all(bool(event.get("matched")) for event in sample_events)
-        for sample_events in samples.values()
-    )
+    successful_samples = 0
+    for sample_events in samples.values():
+        matched_steps = {
+            int(step_index)
+            for event in sample_events
+            if event.get("matched")
+            for step_index in event.get("matched_gold_step_indices", [])
+        }
+        if (
+            len(matched_steps) == num_gold_calls
+            and all(bool(event.get("matched")) for event in sample_events)
+        ):
+            successful_samples += 1
     task_unsolved = bool(samples) and successful_samples == 0
     return {
         "total": len(events),
@@ -194,7 +253,7 @@ def static_review_html(
         item = payload[index]
         row = item["row"]
         review = item["review"]
-        trajectory = row.get("trajectory", {})
+        trajectory = trajectory_view(row)
         query = trajectory.get("query", "")
         categories = ", ".join(review["categories"])
         sidebar.append(
@@ -214,39 +273,52 @@ def static_review_html(
                 + "<br>".join(html.escape(hint) for hint in review["grounding_hints"])
                 + "</div>"
             )
-        steps: list[str] = []
-        for step_index, step in enumerate(trajectory.get("steps", []), 1):
-            calls = "".join(
-                '<div class="call">'
-                f'<div class="call-name">{html.escape(str(call.get("tool_name")))}</div>'
-                '<div class="grid"><div>'
-                + static_details("Arguments", call.get("arguments"), open_by_default=True)
-                + "</div><div>"
-                + static_details(
-                    "Recorded tool output", call.get("output"), open_by_default=True
+        turns: list[str] = []
+        for turn_position, turn in enumerate(trajectory.get("turns", []), 1):
+            steps: list[str] = []
+            for step_position, step in enumerate(turn.get("steps", []), 1):
+                calls = "".join(
+                    '<div class="call">'
+                    f'<div class="call-name">{html.escape(str(call.get("tool_name")))}</div>'
+                    '<div class="grid"><div>'
+                    + static_details("Arguments", call.get("arguments"), open_by_default=True)
+                    + "</div><div>"
+                    + static_details(
+                        "Recorded tool output", call.get("output"), open_by_default=True
+                    )
+                    + "</div></div></div>"
+                    for call in step.get("tool_calls", [])
                 )
-                + "</div></div></div>"
-                for call in step.get("tool_calls", [])
-            )
-            steps.append(
-                '<section class="card step">'
-                f"<h2>Step {step_index}</h2>{calls}"
-                f'<div class="meta">{html.escape(str(step.get("reasoning", "")))}</div>'
-                "<h3>API state diff</h3>"
-                + static_state_diff(step.get("pre_state"), step.get("post_state"))
-                + static_details("Pre-state", step.get("pre_state"))
-                + static_details("Post-state", step.get("post_state"))
-                + static_details(
-                    "State verification",
-                    step.get("state_verification"),
-                    open_by_default=True,
+                steps.append(
+                    '<section class="card step">'
+                    f"<h3>Step {step.get('step_number', step_position)}</h3>{calls}"
+                    f'<div class="meta">{html.escape(str(step.get("reasoning", "")))}</div>'
+                    "<h3>API state diff</h3>"
+                    + static_state_diff(step.get("pre_state"), step.get("post_state"))
+                    + static_details("Pre-state", step.get("pre_state"))
+                    + static_details("Post-state", step.get("post_state"))
+                    + static_details(
+                        "State verification",
+                        step.get("state_verification"),
+                        open_by_default=True,
+                    )
+                    + static_details(
+                        "Quality verification",
+                        step.get("quality_verification"),
+                        open_by_default=True,
+                    )
+                    + "</section>"
                 )
-                + static_details(
-                    "Quality verification",
-                    step.get("quality_verification"),
-                    open_by_default=True,
-                )
-                + "</section>"
+            turns.append(
+                '<section class="turn-block">'
+                f"<h2>Turn {turn.get('turn_number', turn_position)}</h2>"
+                f'<div class="query">{html.escape(str(turn.get("user_query", "")))}</div>'
+                f'<div class="meta">Intent: {html.escape(str(turn.get("query_intent", "")))}</div>'
+                + "".join(steps)
+                + '<section class="card"><h3>Assistant response</h3>'
+                f'<div>{html.escape(str(turn.get("assistant_response", "")))}</div>'
+                + static_details("Turn quality verification", turn.get("quality_verification"))
+                + "</section></section>"
             )
         articles.append(
             f'<article id="static-row-{index}" class="static-example">'
@@ -260,10 +332,7 @@ def static_review_html(
                 "initial_api_state", row.get("initial_api_state"), open_by_default=True
             )
             + "</section>"
-            + "".join(steps)
-            + '<section class="card"><h2>Final response</h2>'
-            + f"<div>{html.escape(str(trajectory.get('final_response', '')))}</div>"
-            + "</section>"
+            + "".join(turns)
             + '<section class="card"><h2>Audit evidence</h2>'
             + static_details("Generation metadata", row.get("generation_metadata"))
             + static_details("Full verification result", row.get("verification_result"))
@@ -287,7 +356,7 @@ def build_payload(
     tools: collections.Counter[str] = collections.Counter()
     payload: list[dict[str, Any]] = []
     for index, row in enumerate(rows):
-        trajectory = row.get("trajectory", {})
+        trajectory = trajectory_view(row)
         row_categories = trajectory.get("categories_used", [])
         row_tools = trajectory.get("tools_used", [])
         categories.update(row_categories)
@@ -382,6 +451,7 @@ white-space:pre-wrap;word-break:break-word;color:#d8e6f5}details{margin:8px 0}su
 .diff{width:100%;border-collapse:collapse;font-size:12px}.diff td,.diff th{border-bottom:1px solid var(--line);padding:6px;text-align:left;vertical-align:top}
 .diff .before{color:#ffb1b1}.diff .after{color:#aef0c6}.ok{color:var(--good)}.bad-text{color:var(--bad)}.warn-text{color:var(--warn)}
 .notice{padding:11px 13px;border-radius:8px;background:#3c321e;border:1px solid #665126;margin:8px 0}.danger{background:#40232a;border-color:#6f3541}
+.turn-block{margin:24px 0 34px;padding-top:8px;border-top:2px solid var(--line)}.turn-block>h2{font-size:20px;color:var(--accent)}
 .empty{color:var(--muted);padding:25px;text-align:center}.footer-note{color:var(--muted);font-size:12px;margin-top:18px}
 @media(max-width:850px){.layout{grid-template-columns:1fr}.sidebar{max-height:42vh;border-right:0;border-bottom:1px solid var(--line)}
 .app{height:auto}.main{padding:16px}.headline{display:block}}
@@ -396,7 +466,7 @@ white-space:pre-wrap;word-break:break-word;color:#d8e6f5}details{margin:8px 0}su
     <span class="stat"><b id="eventCount"></b> Qwen events in snapshot</span>
     <span class="stat">pass@1: <b id="pass1"></b></span>
     <span class="stat">pass@16: <b id="pass16"></b></span>
-    <span class="stat">source: <b>raw500 / Grok 4.5</b></span>
+    <span class="stat">view: <b>full multi-turn trajectory</b></span>
   </header>
   <div class="layout">
     <aside class="sidebar">
@@ -435,6 +505,25 @@ const badge=(text,kind="")=>`<span class="tag ${kind}">${esc(text)}</span>`;
 const detail=(title,value,open=false)=>`<details ${open?"open":""}><summary>${esc(title)}</summary><pre>${pretty(value)}</pre></details>`;
 let filtered=DATA.map((_,i)=>i), selected=0;
 
+function trajectoryView(row){
+  if(row.trajectory){
+    const t=row.trajectory;
+    const turns=Array.isArray(t.turns)?t.turns:[{
+      turn_number:1,user_query:t.query||"",query_intent:t.query_intent||"",
+      steps:t.steps||[],assistant_response:t.final_response||""
+    }];
+    return {...t,query:t.query||"",turns};
+  }
+  const c=row.conversation||{},turns=Array.isArray(c.turns)?c.turns:[];
+  return {
+    query:c.overall_task||"",query_intent:c.overall_task||"",
+    categories_used:c.categories_used||[],tools_used:c.tools_used||[],
+    initial_api_state:c.initial_api_state||{},turns,
+    steps:turns.flatMap(turn=>turn.steps||[]),
+    final_response:turns.length?(turns[turns.length-1].assistant_response||""):""
+  };
+}
+
 function flatten(value,prefix="",out={}){
   if(value && typeof value==="object" && !Array.isArray(value)){
     const keys=Object.keys(value); if(!keys.length) out[prefix||"$"]={};
@@ -454,6 +543,25 @@ function renderCall(call){
   return `<div class="call"><div class="call-name">${esc(call.tool_name)}</div>
     <div class="grid"><div>${detail("Arguments",call.arguments,true)}</div><div>${detail("Recorded tool output",call.output,true)}</div></div></div>`;
 }
+function renderStep(step,index){
+  return `<section class="card step"><h3>Step ${esc(step.step_number||index+1)}</h3>
+    ${(step.tool_calls||[]).map(renderCall).join("")}
+    <div><b>Generator reasoning</b><div class="meta">${esc(step.reasoning||"")}</div></div>
+    <h3 style="margin-top:14px">API state diff</h3>${stateDiff(step.pre_state,step.post_state)}
+    ${detail("Pre-state",step.pre_state)}${detail("Post-state",step.post_state)}
+    <div class="grid"><div>${detail("State verification",step.state_verification,true)}</div>
+    <div>${detail("Quality verification",step.quality_verification,true)}</div></div></section>`;
+}
+function renderTurn(turn,index){
+  return `<section class="turn-block"><h2>Turn ${esc(turn.turn_number||index+1)}</h2>
+    <div class="query">${esc(turn.user_query||turn.query||"")}</div>
+    <div class="meta">Intent: ${esc(turn.query_intent||"")}</div>
+    ${(turn.steps||[]).map(renderStep).join("")}
+    <section class="card"><h3>Assistant response</h3><div>${esc(turn.assistant_response||"")}</div>
+    ${detail("Expected tools",turn.expected_tools||[])}
+    ${detail("Execution context",turn.execution_context||{})}
+    ${detail("Turn quality verification",turn.quality_verification||{})}</section></section>`;
+}
 function renderEval(review){
   const ev=review.model_eval;
   if(!ev.total)return `<div class="meta">No Qwen rollout events for this row at snapshot time.</div>`;
@@ -464,19 +572,13 @@ function renderEval(review){
     ${ev.sample_matches.length?detail("Sample matched predictions",ev.sample_matches):""}`;
 }
 function render(index){
-  selected=index; const item=DATA[index],row=item.row,r=item.review,t=row.trajectory||{};
+  selected=index; const item=DATA[index],row=item.row,r=item.review,t=trajectoryView(row);
   const gates=row.verification_result||{},meta=row.generation_metadata||{};
   const notices=[];
   if(r.model_eval.systematic_failure)notices.push(`<div class="notice danger"><b>Systematic Qwen failure in snapshot.</b> Inspect query vs gold arguments below.</div>`);
   if(r.grounding_hints.length)notices.push(`<div class="notice"><b>Heuristic grounding hints:</b><br>${r.grounding_hints.map(esc).join("<br>")}</div>`);
   if(r.semantic_duplicate_count>1)notices.push(`<div class="notice"><b>Semantic duplicate group:</b> ${r.semantic_duplicate_count} rows; first row #${r.semantic_first_index}.</div>`);
-  const steps=(t.steps||[]).map((step,i)=>`<section class="card step"><h2>Step ${i+1}</h2>
-    ${(step.tool_calls||[]).map(renderCall).join("")}
-    <div><b>Generator reasoning</b><div class="meta">${esc(step.reasoning||"")}</div></div>
-    <h3 style="margin-top:14px">API state diff</h3>${stateDiff(step.pre_state,step.post_state)}
-    ${detail("Pre-state",step.pre_state)}${detail("Post-state",step.post_state)}
-    <div class="grid"><div>${detail("State verification",step.state_verification,true)}</div>
-    <div>${detail("Quality verification",step.quality_verification,true)}</div></div></section>`).join("");
+  const turns=(t.turns||[]).map(renderTurn).join("");
   $("content").innerHTML=`<div class="headline"><div><h1>Row #${index}</h1><div class="meta">
     ${(r.categories||[]).map(x=>badge(x)).join(" ")} ${(r.tools||[]).map(x=>badge(x)).join(" ")}</div></div>
     <div class="meta">attempt ${esc(row.generation_attempt)} · ${esc(row.timestamp)}</div></div>
@@ -487,8 +589,7 @@ function render(index){
       <div class="meta">intent: ${esc(meta.query_intent)}</div></section>
       <section class="card"><h3>Qwen proxy snapshot</h3>${renderEval(r)}</section></div>
     <section class="card"><h2>Initial hidden API state</h2>${detail("initial_api_state",row.initial_api_state||t.initial_api_state,true)}</section>
-    ${steps}
-    <section class="card"><h2>Final response</h2><div>${esc(t.final_response)}</div></section>
+    ${turns}
     <section class="card"><h2>Audit evidence</h2>
       ${detail("Generation metadata",row.generation_metadata)}
       ${detail("Full verification result",row.verification_result)}
@@ -505,7 +606,7 @@ function applyFilters(){
   const search=$("search").value.toLowerCase(),cat=$("category").value,mode=$("filter").value;
   const curated=new Set(SUMMARY.curated_indices);
   filtered=DATA.map((item,index)=>({item,index})).filter(({item,index})=>{
-    const r=item.review,t=item.row.trajectory||{};
+    const r=item.review,t=trajectoryView(item.row);
     const hay=[t.query,...r.categories,...r.tools].join(" ").toLowerCase();
     if(search&&!hay.includes(search))return false;
     if(cat&&!(r.categories||[]).includes(cat))return false;
@@ -518,7 +619,7 @@ function applyFilters(){
   }).map(x=>x.index);
   $("visibleCount").textContent=`${filtered.length} visible`;
   $("list").innerHTML=filtered.map(index=>{
-    const {row,review:r}=DATA[index],t=row.trajectory||{};
+    const {row,review:r}=DATA[index],t=trajectoryView(row);
     return `<div class="item ${index===selected?"active":""}" data-index="${index}">
       <div class="q"><b>#${index}</b> ${esc(t.query)}</div><div class="meta">
       ${(r.categories||[]).map(x=>badge(x)).join("")}

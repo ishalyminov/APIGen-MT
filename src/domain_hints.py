@@ -35,6 +35,14 @@ When generating queries for Vehicle Control:
 5. PREREQUISITE TOOLS:
    - Do NOT add prerequisite tools unless user explicitly mentions them
    - Example: "Start the engine" -> startEngine only, NOT pressBrakePedal + startEngine
+
+6. STATE-CHANGING CONTROLS:
+   - Compare every requested setting with generator state. Call startEngine only
+     while stopped, lockDoors only while at least one door is unlocked, and
+     setHeadlights/setCruiseControl only when the requested value differs.
+   - If a later turn needs another mutation, request a genuinely different
+     setting or an explicit reversible transition; never repeat a no-op merely
+     to fill the exact call schedule.
 """,
     "Travel Booking": """
 === TRAVEL BOOKING DOMAIN RULES ===
@@ -57,6 +65,10 @@ get_user_id to resolve an existing recipient before send_message. Do NOT call
 add_contact merely as a prerequisite to messaging; use it only when the user
 explicitly asks to add a genuinely new contact and the state makes that
 mutation feasible. Never add an existing contact or send to an invented ID.
+delete_message always needs one concrete message_id: bind it to an earlier
+tool output that actually declares that exact field, or state the plausible ID
+in the user request. "Latest message" is not enough when no selected call
+returns its message_id.
 """,
     "Science": """
 === SCIENCE DOMAIN RULES ===
@@ -85,13 +97,20 @@ to that visible tool output. Never resolve/close a ticket already in that
 state, and never invent a ticket ID. In particular, keep using `create_ticket`'s
 returned `id` for "that ticket" or "the ticket I just created"; do not replace
 it with whatever ticket a broad `get_user_tickets` read happens to return.
+Despite its plural name, get_user_tickets has a single-object output schema and
+cannot satisfy requests to list, enumerate, count, or summarize all tickets.
+Phrase the request around the one matching ticket it returns. For edit_ticket,
+every field included in `updates` must differ from current state; do not claim
+to raise a priority to the value it already has while changing another field.
 """,
     "Posting Api": """
 === POSTING DOMAIN RULES ===
 Authenticate before protected posting operations. Bind comments, mentions,
 retweets, and follow-up reads to a real earlier tweet/user result. Follow or
 unfollow only when the generator state shows that the relationship will
-actually change.
+actually change. A comment, mention, or retweet must also create a genuinely
+new interaction in simulator state; do not repeat an existing interaction or
+reuse the same mutation later merely to fill the call schedule.
 """,
 }
 

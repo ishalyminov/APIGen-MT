@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resume a matched 50-row DeepSeek/GLM teacher comparison.
+"""Resume a matched DeepSeek/GLM teacher comparison or scale DeepSeek to 500.
 
 DeepSeek keeps the thirteen accepted rows already paid for.  The remaining
 schedule balances final category and turn-count marginals; GLM runs the same
@@ -19,7 +19,7 @@ import sys
 import threading
 import time
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +64,10 @@ CATEGORIES = (
 )
 
 
+class FatalProviderError(RuntimeError):
+    """Account/provider failure for which retrying paid candidates is useless."""
+
+
 @dataclass(frozen=True)
 class Spec:
     index: int
@@ -72,6 +76,7 @@ class Spec:
     required_tool: str | None = None
     deepseek_seed: str | None = None
     companion_category: str | None = None
+    enforce_required_tool: bool = False
 
     @property
     def turns(self) -> int:
@@ -297,11 +302,175 @@ def build_schedule(output_dir: Path, seed: int) -> list[Spec]:
     return specs
 
 
+def _proportional_histogram(
+    weights: dict[Any, int], total: int, *, seed: int
+) -> dict[Any, int]:
+    """Scale integer weights to an exact total with deterministic remainders."""
+
+    denominator = sum(weights.values())
+    result = {
+        key: total * weight // denominator for key, weight in weights.items()
+    }
+    remaining = total - sum(result.values())
+    order = list(weights)
+    random.Random(seed).shuffle(order)
+    order.sort(
+        key=lambda key: (total * weights[key]) % denominator,
+        reverse=True,
+    )
+    for key in order[:remaining]:
+        result[key] += 1
+    return result
+
+
+def _focus_category(row: dict[str, Any]) -> str:
+    category = str(
+        row.get("generation_metadata", {}).get("focus_category") or ""
+    )
+    if category not in CATEGORIES:
+        raise ValueError(f"Seed row has invalid focus category: {category!r}")
+    return category
+
+
+def build_scaled_deepseek_schedule(
+    *, seed_jsonl: Path, target: int, seed: int
+) -> list[Spec]:
+    """Preserve paid rows and create a balanced, coverage-complete schedule."""
+
+    seed_jsonl = seed_jsonl.resolve()
+    seed_rows = list(_read_jsonl(seed_jsonl))
+    if not seed_rows:
+        raise ValueError(f"Scale seed is empty: {seed_jsonl}")
+    if len(seed_rows) >= target:
+        raise ValueError(
+            f"Scale seed already has {len(seed_rows)} rows for target {target}"
+        )
+
+    specs: list[Spec] = []
+    for index, row in enumerate(seed_rows):
+        schedule = tuple(
+            sum(
+                len(step.get("tool_calls", []))
+                for step in turn.get("steps", [])
+            )
+            for turn in row.get("conversation", {}).get("turns", [])
+        )
+        if not schedule:
+            raise ValueError(f"Seed row {index} contains no turns/calls")
+        specs.append(
+            Spec(
+                index=index,
+                category=_focus_category(row),
+                schedule=schedule,
+                deepseek_seed=f"{seed_jsonl}#{index}",
+            )
+        )
+
+    target_categories = _proportional_histogram(
+        {category: 1 for category in CATEGORIES}, target, seed=seed + 1
+    )
+    target_turns = _proportional_histogram(
+        {2: 4, 3: 10, 4: 12, 5: 24}, target, seed=seed + 2
+    )
+    target_steps = _proportional_histogram(
+        {15: 12, 16: 8, 17: 8, 18: 8, 19: 7, 20: 7},
+        target,
+        seed=seed + 3,
+    )
+    observed_categories = Counter(spec.category for spec in specs)
+    observed_turns = Counter(spec.turns for spec in specs)
+    observed_steps = Counter(spec.steps for spec in specs)
+
+    def deficit_values(
+        target_counts: dict[Any, int], observed: Counter[Any]
+    ) -> list[Any]:
+        values: list[Any] = []
+        for value, count in target_counts.items():
+            deficit = count - observed[value]
+            if deficit < 0:
+                raise ValueError(
+                    f"Seed overfills scaled bucket {value!r}: "
+                    f"{observed[value]} > {count}"
+                )
+            values.extend([value] * deficit)
+        return values
+
+    categories = deficit_values(target_categories, observed_categories)
+    turns = deficit_values(target_turns, observed_turns)
+    steps = deficit_values(target_steps, observed_steps)
+    expected_new = target - len(specs)
+    if not (len(categories) == len(turns) == len(steps) == expected_new):
+        raise AssertionError("Scaled marginal deficits have different lengths")
+    rng = random.Random(seed)
+    rng.shuffle(categories)
+    rng.shuffle(turns)
+    rng.shuffle(steps)
+    companions = {
+        "Communication": "Events",
+        "Events": "Communication",
+        "Finance": "Communication",
+        "Posting Api": "Communication",
+        "Science": "Communication",
+        "Storage": "Communication",
+        "Travel Booking": "Communication",
+        "Vehicle Control": "Communication",
+    }
+    for offset, (category, turn_count, step_count) in enumerate(
+        zip(categories, turns, steps)
+    ):
+        specs.append(
+            Spec(
+                index=len(seed_rows) + offset,
+                category=category,
+                schedule=_balanced_vector(step_count, turn_count, rng),
+                companion_category=companions[category],
+            )
+        )
+
+    # The paid 49-row seed already executes 112/129 tools. Hard-target only
+    # the per-tool deficits needed to bring every catalog tool to two accepted
+    # rows/calls. This guarantees full coverage without constraining all 451
+    # new rows and recreating the earlier low-yield rare-tool problem.
+    catalog = _tool_catalog()
+    seed_tool_counts = Counter(
+        tool for row in seed_rows for tool in _actual_tools(row)
+    )
+    by_category_indices: dict[str, list[int]] = defaultdict(list)
+    for index in range(len(seed_rows), len(specs)):
+        by_category_indices[specs[index].category].append(index)
+    for category in CATEGORIES:
+        category_rng = random.Random(f"{seed}:coverage:{category}")
+        category_rng.shuffle(by_category_indices[category])
+        required = [
+            tool
+            for tool in catalog[category]
+            for _ in range(max(0, 2 - seed_tool_counts[tool]))
+        ]
+        category_rng.shuffle(required)
+        if len(required) > len(by_category_indices[category]):
+            raise RuntimeError(
+                f"Not enough {category} rows for {len(required)} coverage targets"
+            )
+        for tool, index in zip(required, by_category_indices[category]):
+            specs[index] = replace(
+                specs[index],
+                required_tool=tool,
+                enforce_required_tool=True,
+            )
+
+    if len(specs) != target:
+        raise AssertionError(f"Expected {target} specs, got {len(specs)}")
+    return specs
+
+
 def _seed_row(spec: Spec, output_dir: Path) -> dict[str, Any]:
     if not spec.deepseek_seed:
         raise ValueError("not a seed spec")
     relative, ordinal_text = spec.deepseek_seed.rsplit("#", 1)
-    rows = list(_read_jsonl(output_dir / "deepseek_v4_flash_latest" / relative))
+    seed_path = Path(relative)
+    if not seed_path.is_absolute():
+        seed_path = output_dir / "deepseek_v4_flash_latest" / seed_path
+    rows = list(_read_jsonl(seed_path))
     return rows[int(ordinal_text)]
 
 
@@ -328,6 +497,11 @@ def validate_row(
     focus_tools = set(_tool_catalog().get(spec.category, []))
     if not actual_tools.intersection(focus_tools):
         errors.append(f"MISSING_FOCUS_CATEGORY:{spec.category}")
+    if (
+        spec.enforce_required_tool
+        and spec.required_tool not in actual_tools
+    ):
+        errors.append(f"MISSING_REQUIRED_TOOL:{spec.required_tool}")
     if not row.get("verification_result", {}).get("overall_verification_passed"):
         errors.append("OVERALL_VERIFICATION_FAILED")
     metadata = row.get("generation_metadata", {})
@@ -465,6 +639,8 @@ def _command(
     usage: Path,
     archive: Path,
     registry: Path,
+    include_companion_category: bool,
+    extra_dedupe_against: tuple[Path, ...] = (),
 ) -> list[str]:
     command = [
         sys.executable,
@@ -519,7 +695,11 @@ def _command(
         "1",
         "--no-resume",
     ]
-    if spec.companion_category:
+    for path in extra_dedupe_against:
+        command.extend(["--dedupe-against", str(path)])
+    if spec.enforce_required_tool and spec.required_tool:
+        command.extend(["--required-tool", spec.required_tool])
+    if include_companion_category and spec.companion_category:
         command.extend(["--context-category", spec.companion_category])
     return command
 
@@ -552,8 +732,11 @@ def generate_spec(
     teacher_model: str,
     output_dir: Path,
     registry: Path,
+    symbolic_mode: str,
+    include_companion_category: bool,
     max_attempts: int,
     timeout: int,
+    extra_dedupe_against: tuple[Path, ...] = (),
 ) -> tuple[int, str]:
     output = row_path(output_dir, teacher, spec)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -593,20 +776,31 @@ def generate_spec(
             "APIGEN_BLUEPRINT_GENERATE_REASONING_MAX_TOKENS": "",
             "APIGEN_BLUEPRINT_TURN_COMPILE_REASONING_MAX_TOKENS": "",
             "APIGEN_BLUEPRINT_QUERY_ALIGN_REASONING_MAX_TOKENS": "",
+            # These routes repeatedly consumed the entire 8k completion on
+            # hidden reasoning and returned no JSON despite low effort. Keep
+            # OpenRouter auto-routing among every other compatible provider.
+            "APIGEN_OPENROUTER_IGNORE_PROVIDERS": (
+                "DeepInfra,Inceptron,Cloudflare"
+            ),
             "APIGEN_BLUEPRINT_SEMANTIC_JUDGE_REASONING_EFFORT": "off",
             "APIGEN_FINAL_RESPONSE_GENERATE_REASONING_EFFORT": "off",
             "APIGEN_FINAL_RESPONSE_GROUNDING_JUDGE_REASONING_EFFORT": "off",
             "APIGEN_MAX_OUTPUT_TOKENS": "8192",
             "APIGEN_HTTP_ATTEMPTS": "1",
-            "APIGEN_APPLICATION_LLM_ATTEMPTS": "1",
+            # One retry salvages an empty/malformed provider response without
+            # discarding all successfully compiled turns. The generator's
+            # hard ten-call counter still includes and limits this retry.
+            "APIGEN_APPLICATION_LLM_ATTEMPTS": "2",
             # A stalled OpenRouter backend must not pin a paid candidate for
             # the library default of 15 minutes. One timeout rejects the
             # candidate and its full worst-case cost remains reserved.
-            "APIGEN_LLM_TIMEOUT": "180",
+            "APIGEN_LLM_TIMEOUT": "300",
             # The tested production route compiles one exact turn at a time;
             # with 2-5 turns the full alignment/judge/writer/grounding pipeline
             # still fits the hard ten-request candidate ceiling.
-            "APIGEN_SYMBOLIC_TURNWISE": "1",
+            "APIGEN_SYMBOLIC_TURNWISE": (
+                "1" if symbolic_mode == "turnwise" else "0"
+            ),
             "APIGEN_SYMBOLIC_TURNWISE_MIN_WIDTH": "3",
             "APIGEN_LLM_TRACE_PATH": str(trace),
         }
@@ -617,6 +811,8 @@ def generate_spec(
             usage=usage,
             archive=archive,
             registry=registry,
+            include_companion_category=include_companion_category,
+            extra_dedupe_against=extra_dedupe_against,
         )
         with log.open("w", encoding="utf-8") as destination:
             destination.write(
@@ -640,6 +836,22 @@ def generate_spec(
                 statuses.append(f"a{attempt}:exit={completed.returncode}")
             except subprocess.TimeoutExpired:
                 statuses.append(f"a{attempt}:timeout")
+        if log.exists():
+            with log.open("rb") as source:
+                source.seek(max(0, log.stat().st_size - 32_768))
+                tail = source.read().decode("utf-8", errors="replace").casefold()
+            fatal_markers = (
+                "insufficient credits",
+                "requires more credits",
+                "invalid api key",
+                "authentication failed",
+                "insufficient_quota",
+                "user not found",
+            )
+            if any(marker in tail for marker in fatal_markers):
+                raise FatalProviderError(
+                    f"{spec.stem} hit an account/provider limit; see {log}"
+                )
         if _row_count(output) == 1:
             row = next(_read_jsonl(output))
             errors = validate_row(row, spec=spec, teacher_model=teacher_model)
@@ -675,13 +887,20 @@ def _collect(
     return rows, missing
 
 
-def _write_status(output_dir: Path, teacher: str, specs: list[Spec]) -> dict[str, Any]:
+def _write_status(
+    output_dir: Path,
+    teacher: str,
+    specs: list[Spec],
+    *,
+    target_accepted: int = 50,
+) -> dict[str, Any]:
     rows, missing = _collect(output_dir=output_dir, teacher=teacher, specs=specs)
     calls = [len(_actual_tools(row)) for row in rows]
     status = {
         "teacher": teacher,
         "model": TEACHERS[teacher],
         "accepted": len(rows),
+        "target_accepted": target_accepted,
         "missing_indices": missing,
         "turn_distribution": dict(
             sorted(Counter(len(row["conversation"]["turns"]) for row in rows).items())
@@ -701,8 +920,13 @@ def _write_status(output_dir: Path, teacher: str, specs: list[Spec]) -> dict[str
     base = output_dir / "production_50x2"
     _atomic_json(base / f"{teacher}.status.json", status)
     _atomic_jsonl(base / f"{teacher}.partial.jsonl", rows)
-    if len(rows) == 50:
-        _atomic_jsonl(base / f"{teacher}.50.jsonl", rows)
+    target_path = base / f"{teacher}.{target_accepted}.jsonl"
+    if len(rows) == target_accepted:
+        _atomic_jsonl(target_path, rows)
+    else:
+        # Never leave a stale "complete" aggregate after manual quarantine or
+        # stricter validation removes one of its source rows.
+        target_path.unlink(missing_ok=True)
     return status
 
 
@@ -714,14 +938,64 @@ def main() -> int:
     )
     parser.add_argument("--max-workers", type=int, default=4)
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument(
+        "--max-new-candidates",
+        type=int,
+        help="Stop after this many newly completed candidate subprocesses.",
+    )
+    parser.add_argument(
+        "--symbolic-mode",
+        choices=("turnwise", "whole-episode"),
+        default="turnwise",
+    )
+    parser.add_argument(
+        "--drop-companion-category",
+        action="store_true",
+        help=(
+            "Compile each slot from its focus category only while retaining "
+            "the exact turn/call schedule and required focus tool."
+        ),
+    )
     parser.add_argument("--timeout-seconds", type=int, default=1200)
     parser.add_argument("--seed", type=int, default=20260807)
+    parser.add_argument(
+        "--seed-jsonl",
+        type=Path,
+        help=(
+            "For a DeepSeek scale run, preserve these already-paid accepted "
+            "rows and generate only the remaining target slots."
+        ),
+    )
     parser.add_argument("--total-budget-usd", type=float, default=10.0)
+    parser.add_argument(
+        "--additional-budget-usd",
+        type=float,
+        help=(
+            "Start or resume a persistent incremental budget window on top "
+            "of the already-accounted experiment spend."
+        ),
+    )
+    parser.add_argument(
+        "--incremental-budget-id",
+        help="Stable identifier used to persist an incremental budget window.",
+    )
     parser.add_argument("--budget-safety-reserve-usd", type=float, default=0.75)
+    parser.add_argument("--target-accepted", type=int, default=50)
     parser.add_argument("--schedule-only", action="store_true")
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
-    specs = build_schedule(output_dir, args.seed)
+    if args.target_accepted > 50:
+        if args.teacher != "deepseek":
+            raise ValueError("Targets above 50 currently support DeepSeek only")
+        if args.seed_jsonl is None:
+            raise ValueError("--seed-jsonl is required for a DeepSeek scale run")
+        specs = build_scaled_deepseek_schedule(
+            seed_jsonl=args.seed_jsonl,
+            target=args.target_accepted,
+            seed=args.seed,
+        )
+    else:
+        specs = build_schedule(output_dir, args.seed)
     production = output_dir / "production_50x2"
     production.mkdir(parents=True, exist_ok=True)
     _atomic_jsonl(production / "schedule.jsonl", [asdict(spec) for spec in specs])
@@ -731,6 +1005,16 @@ def main() -> int:
         "step_distribution": dict(sorted(Counter(s.steps for s in specs).items())),
         "category_distribution": dict(sorted(Counter(s.category for s in specs).items())),
         "deepseek_preserved_rows": sum(bool(s.deepseek_seed) for s in specs),
+        "hard_required_tool_rows": sum(s.enforce_required_tool for s in specs),
+        "hard_required_tools": dict(
+            sorted(
+                Counter(
+                    s.required_tool
+                    for s in specs
+                    if s.enforce_required_tool and s.required_tool
+                ).items()
+            )
+        ),
     }
     _atomic_json(production / "schedule_summary.json", schedule_summary)
     print(json.dumps(schedule_summary, indent=2), flush=True)
@@ -740,17 +1024,114 @@ def main() -> int:
         raise RuntimeError("OPENAI_API_KEY and OPENAI_API_BASE must be set")
     if not os.getenv("LLM_PROXY_URL") or not os.getenv("LLM_PROXY_MASTER_KEY"):
         raise RuntimeError("LLM_PROXY_URL and LLM_PROXY_MASTER_KEY must be set")
-    if args.total_budget_usd > 10.0:
-        raise ValueError("The 50x2 experiment hard cap may not exceed $10")
-    if args.total_budget_usd <= 0 or args.budget_safety_reserve_usd < 0:
+    if not 1 <= args.target_accepted <= 500:
+        raise ValueError("--target-accepted must be between 1 and 500")
+    if args.max_new_candidates is not None and args.max_new_candidates <= 0:
+        raise ValueError("--max-new-candidates must be positive")
+    if args.budget_safety_reserve_usd < 0:
         raise ValueError("Budget and reserve must be non-negative")
 
     teachers = ["deepseek", "glm52"] if args.teacher == "both" else [args.teacher]
+    incremental_ledger: dict[str, Any] | None = None
+    if args.additional_budget_usd is not None:
+        if args.teacher == "both":
+            raise ValueError("Incremental budget windows require one --teacher")
+        if not 0 < args.additional_budget_usd <= 5.0:
+            raise ValueError("The incremental hard cap must be in (0, $5]")
+        budget_id = str(args.incremental_budget_id or "")
+        if not budget_id or any(
+            not (character.isalnum() or character in "-_.")
+            for character in budget_id
+        ):
+            raise ValueError(
+                "--incremental-budget-id must contain only letters, digits, -, _, ."
+            )
+        ledger_path = production / "budgets" / f"{budget_id}.json"
+        if ledger_path.exists():
+            incremental_ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            expected = {
+                "teacher": args.teacher,
+                "additional_budget_usd": args.additional_budget_usd,
+                "target_accepted": args.target_accepted,
+            }
+            for key, value in expected.items():
+                if incremental_ledger.get(key) != value:
+                    raise ValueError(
+                        f"Incremental budget ledger {ledger_path} has "
+                        f"{key}={incremental_ledger.get(key)!r}, expected {value!r}"
+                    )
+        else:
+            baseline = _experiment_budget_snapshot(
+                output_dir,
+                total_budget_usd=0.0,
+                safety_reserve_usd=0.0,
+            )
+            baseline_accounted = (
+                baseline["reported_cost_usd"]
+                + baseline["missing_report_reserve_usd"]
+            )
+            incremental_ledger = {
+                "id": budget_id,
+                "teacher": args.teacher,
+                "target_accepted": args.target_accepted,
+                "additional_budget_usd": args.additional_budget_usd,
+                "baseline_reported_cost_usd": baseline["reported_cost_usd"],
+                "baseline_missing_report_reserve_usd": baseline[
+                    "missing_report_reserve_usd"
+                ],
+                "baseline_accounted_spend_usd": baseline_accounted,
+                "absolute_hard_cap_usd": (
+                    baseline_accounted + args.additional_budget_usd
+                ),
+                "created_at": time.time(),
+            }
+            _atomic_json(ledger_path, incremental_ledger)
+        hard_budget_usd = float(incremental_ledger["absolute_hard_cap_usd"])
+    else:
+        if args.total_budget_usd > 50.0:
+            raise ValueError("The generation hard cap may not exceed $50")
+        if args.total_budget_usd <= 0:
+            raise ValueError("Budget must be positive")
+        hard_budget_usd = args.total_budget_usd
+
+    def budget_snapshot() -> dict[str, Any]:
+        snapshot = _experiment_budget_snapshot(
+            output_dir,
+            total_budget_usd=hard_budget_usd,
+            safety_reserve_usd=args.budget_safety_reserve_usd,
+        )
+        if incremental_ledger is not None:
+            current_accounted = (
+                snapshot["reported_cost_usd"]
+                + snapshot["missing_report_reserve_usd"]
+            )
+            baseline_accounted = float(
+                incremental_ledger["baseline_accounted_spend_usd"]
+            )
+            snapshot["incremental_budget"] = {
+                **incremental_ledger,
+                "accounted_spend_usd": max(
+                    0.0, current_accounted - baseline_accounted
+                ),
+                "remaining_usd": max(
+                    0.0,
+                    float(incremental_ledger["additional_budget_usd"])
+                    - max(0.0, current_accounted - baseline_accounted),
+                ),
+            }
+        return snapshot
+
     registry = output_dir / "dedupe_registry.txt"
     progress_lock = threading.Lock()
     failed_any = False
     for teacher in teachers:
         model = TEACHERS[teacher]
+        status = _write_status(
+            output_dir,
+            teacher,
+            specs,
+            target_accepted=args.target_accepted,
+        )
         pending = [
             spec
             for spec in specs
@@ -762,9 +1143,8 @@ def main() -> int:
                 spec=spec,
             )
         ]
-        status = _write_status(output_dir, teacher, specs)
         print(
-            f"{teacher}: {status['accepted']}/50 accepted; "
+            f"{teacher}: {status['accepted']}/{args.target_accepted} accepted; "
             f"launching {len(pending)} slots",
             flush=True,
         )
@@ -773,26 +1153,33 @@ def main() -> int:
         in_flight: dict[concurrent.futures.Future, Spec] = {}
         completed_count = 0
         budget_blocked = False
+        fatal_provider_error = False
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=args.max_workers
         ) as executor:
             while work_queue or in_flight:
-                while work_queue and len(in_flight) < args.max_workers:
+                while (
+                    work_queue
+                    and len(in_flight) < args.max_workers
+                    and status["accepted"] + len(in_flight)
+                    < args.target_accepted
+                    and (
+                        args.max_new_candidates is None
+                        or completed_count + len(in_flight)
+                        < args.max_new_candidates
+                    )
+                ):
                     # Logs from already-started workers are normally included
                     # in missing_report_reserve. Also reserve every in-memory
                     # future to close the tiny race before its log is created;
                     # double reservation is intentional and conservative.
-                    budget = _experiment_budget_snapshot(
-                        output_dir,
-                        total_budget_usd=args.total_budget_usd,
-                        safety_reserve_usd=args.budget_safety_reserve_usd,
-                    )
+                    budget = budget_snapshot()
                     prospective = (
                         budget["effective_spend_usd"]
                         + (len(in_flight) + 1)
                         * MAX_CANDIDATE_COST_USD[teacher]
                     )
-                    if prospective > args.total_budget_usd:
+                    if prospective > hard_budget_usd:
                         budget_blocked = True
                         break
                     spec = work_queue.pop(0)
@@ -804,10 +1191,19 @@ def main() -> int:
                         teacher_model=model,
                         output_dir=output_dir,
                         registry=registry,
+                        symbolic_mode=args.symbolic_mode,
+                        include_companion_category=(
+                            not args.drop_companion_category
+                        ),
                         # Global admission happens after every candidate, so a
                         # worker may never hide several retries behind one check.
                         max_attempts=1,
                         timeout=args.timeout_seconds,
+                        extra_dedupe_against=(
+                            (args.seed_jsonl.resolve(),)
+                            if args.seed_jsonl is not None
+                            else ()
+                        ),
                     )
                     in_flight[future] = spec
                 if not in_flight:
@@ -821,37 +1217,62 @@ def main() -> int:
                     completed_count += 1
                     try:
                         _, result = future.result()
+                    except FatalProviderError as exc:
+                        result = f"fatal:{exc}"
+                        fatal_provider_error = True
+                        work_queue.clear()
                     except Exception as exc:  # retain all other tasks and ledgers
                         result = f"exception:{type(exc).__name__}:{exc}"
                     accepted = result.startswith(("accepted-", "already-complete"))
-                    if not accepted and attempt_counts[spec.index] < args.max_attempts:
+                    if (
+                        not accepted
+                        and not fatal_provider_error
+                        and attempt_counts[spec.index] < args.max_attempts
+                    ):
                         work_queue.append(spec)
                     with progress_lock:
-                        status = _write_status(output_dir, teacher, specs)
-                        budget = _experiment_budget_snapshot(
+                        status = _write_status(
                             output_dir,
-                            total_budget_usd=args.total_budget_usd,
-                            safety_reserve_usd=args.budget_safety_reserve_usd,
+                            teacher,
+                            specs,
+                            target_accepted=args.target_accepted,
                         )
+                        budget = budget_snapshot()
                         _atomic_json(production / "budget_status.json", budget)
                     print(
                         f"[{completed_count}] {teacher} {spec.stem}: {result}; "
-                        f"accepted={status['accepted']}/50; "
+                        f"accepted={status['accepted']}/{args.target_accepted}; "
                         f"reported_total=${budget['reported_cost_usd']:.4f}; "
                         f"reserved_total=${budget['effective_spend_usd']:.4f}",
                         flush=True,
                     )
+                if fatal_provider_error:
+                    for future in in_flight:
+                        future.cancel()
+                    work_queue.clear()
             if budget_blocked:
                 print(
                     "Hard budget admission stopped new candidates; in-flight "
                     "candidates were already fully reserved.",
                     file=sys.stderr,
                 )
-        status = _write_status(output_dir, teacher, specs)
-        if status["accepted"] != 50:
+            if fatal_provider_error:
+                print(
+                    "Fatal account/provider error stopped new candidates; "
+                    "rerun after fixing the account state.",
+                    file=sys.stderr,
+                )
+        status = _write_status(
+            output_dir,
+            teacher,
+            specs,
+            target_accepted=args.target_accepted,
+        )
+        if status["accepted"] < args.target_accepted:
             failed_any = True
             print(
-                f"{teacher} incomplete: {status['accepted']}/50; rerun to "
+                f"{teacher} incomplete: {status['accepted']}/"
+                f"{args.target_accepted}; rerun to "
                 "retry only missing slots.",
                 file=sys.stderr,
             )
