@@ -333,9 +333,20 @@ def _focus_category(row: dict[str, Any]) -> str:
 
 
 def build_scaled_deepseek_schedule(
-    *, seed_jsonl: Path, target: int, seed: int
+    *,
+    seed_jsonl: Path,
+    target: int,
+    seed: int,
+    min_steps: int = 15,
+    max_steps: int = 20,
 ) -> list[Spec]:
     """Preserve paid rows and create a balanced, coverage-complete schedule."""
+
+    if not 1 <= min_steps <= max_steps <= 20:
+        raise ValueError(
+            "Scaled step bounds must satisfy 1 <= min_steps <= "
+            "max_steps <= 20"
+        )
 
     seed_jsonl = seed_jsonl.resolve()
     seed_rows = list(_read_jsonl(seed_jsonl))
@@ -372,8 +383,11 @@ def build_scaled_deepseek_schedule(
     target_turns = _proportional_histogram(
         {2: 4, 3: 10, 4: 12, 5: 24}, target, seed=seed + 2
     )
+    # Keep total tool-call counts genuinely uniform. In particular, a broad
+    # 8..20 scale run should contain approximately the same number of short,
+    # medium, and long episodes instead of concentrating every row at 15..20.
     target_steps = _proportional_histogram(
-        {15: 12, 16: 8, 17: 8, 18: 8, 19: 7, 20: 7},
+        {steps: 1 for steps in range(min_steps, max_steps + 1)},
         target,
         seed=seed + 3,
     )
@@ -441,6 +455,13 @@ def build_scaled_deepseek_schedule(
     for category in CATEGORIES:
         category_rng = random.Random(f"{seed}:coverage:{category}")
         category_rng.shuffle(by_category_indices[category])
+        # Put rare-tool coverage constraints on the roomier episodes first.
+        # Short rows should remain coherent short tasks, not eight-call plans
+        # contorted around an unrelated catalog-coverage target.
+        by_category_indices[category].sort(
+            key=lambda index: specs[index].steps,
+            reverse=True,
+        )
         required = [
             tool
             for tool in catalog[category]
@@ -1048,6 +1069,18 @@ def main() -> int:
     )
     parser.add_argument("--budget-safety-reserve-usd", type=float, default=0.75)
     parser.add_argument("--target-accepted", type=int, default=50)
+    parser.add_argument(
+        "--scale-min-steps",
+        type=int,
+        default=15,
+        help="Minimum total tool calls for scaled runs (inclusive).",
+    )
+    parser.add_argument(
+        "--scale-max-steps",
+        type=int,
+        default=20,
+        help="Maximum total tool calls for scaled runs (inclusive).",
+    )
     parser.add_argument("--schedule-only", action="store_true")
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()
@@ -1060,6 +1093,8 @@ def main() -> int:
             seed_jsonl=args.seed_jsonl,
             target=args.target_accepted,
             seed=args.seed,
+            min_steps=args.scale_min_steps,
+            max_steps=args.scale_max_steps,
         )
     else:
         specs = build_schedule(output_dir, args.seed)
