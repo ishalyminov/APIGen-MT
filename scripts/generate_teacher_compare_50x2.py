@@ -483,6 +483,8 @@ def validate_row(
     *,
     spec: Spec,
     teacher_model: str,
+    final_response_model: str = QWEN_WRITER,
+    allow_legacy_qwen_writer: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     conversation = row.get("conversation", {})
@@ -509,14 +511,24 @@ def validate_row(
     if int(metrics.get("hidden_argument_count", -1)) != 0:
         errors.append(f"HIDDEN_ARGUMENTS:{metrics.get('hidden_argument_count')}")
     routing = metadata.get("model_routing", {})
-    expected_routing = {
-        "generator": teacher_model,
-        "semantic_judge": teacher_model,
-        "final_response_writer": QWEN_WRITER,
-        "grounding_judge": teacher_model,
-    }
-    if routing != expected_routing:
-        errors.append(f"ROUTING:{routing}!={expected_routing}")
+    allowed_writers = {final_response_model}
+    if allow_legacy_qwen_writer:
+        # A resumed production run may intentionally switch the writer after
+        # accepting rows with the previous local-Qwen route. Preserve those
+        # paid rows while requiring every newly generated row to use the
+        # current command's writer.
+        allowed_writers.add(QWEN_WRITER)
+    expected_routings = [
+        {
+            "generator": teacher_model,
+            "semantic_judge": teacher_model,
+            "final_response_writer": writer,
+            "grounding_judge": teacher_model,
+        }
+        for writer in sorted(allowed_writers)
+    ]
+    if routing not in expected_routings:
+        errors.append(f"ROUTING:{routing}!={expected_routings}")
     if any(not str(turn.get("assistant_response", "")).strip() for turn in turns):
         errors.append("EMPTY_ASSISTANT_RESPONSE")
     if "The requested actions completed successfully." in json.dumps(row):
@@ -533,13 +545,21 @@ def _has_valid_row(
     *,
     teacher: str,
     teacher_model: str,
+    final_response_model: str,
+    allow_legacy_qwen_writer: bool,
     spec: Spec,
 ) -> bool:
     path = row_path(output_dir, teacher, spec)
     if _row_count(path) != 1:
         return False
     row = next(_read_jsonl(path))
-    return not validate_row(row, spec=spec, teacher_model=teacher_model)
+    return not validate_row(
+        row,
+        spec=spec,
+        teacher_model=teacher_model,
+        final_response_model=final_response_model,
+        allow_legacy_qwen_writer=allow_legacy_qwen_writer,
+    )
 
 
 def _usage_summary(output_dir: Path, teacher: str) -> dict[str, Any]:
@@ -635,6 +655,7 @@ def _command(
     *,
     spec: Spec,
     teacher_model: str,
+    final_response_model: str,
     output: Path,
     usage: Path,
     archive: Path,
@@ -666,7 +687,7 @@ def _command(
         "--judge-model",
         teacher_model,
         "--final-response-model",
-        QWEN_WRITER,
+        final_response_model,
         "--tool-pool",
         str(TOOL_POOL),
         "--invocation-examples",
@@ -730,6 +751,8 @@ def generate_spec(
     spec: Spec,
     teacher: str,
     teacher_model: str,
+    final_response_model: str,
+    allow_legacy_qwen_writer: bool,
     output_dir: Path,
     registry: Path,
     symbolic_mode: str,
@@ -742,7 +765,13 @@ def generate_spec(
     output.parent.mkdir(parents=True, exist_ok=True)
     if _row_count(output) == 1:
         row = next(_read_jsonl(output))
-        errors = validate_row(row, spec=spec, teacher_model=teacher_model)
+        errors = validate_row(
+            row,
+            spec=spec,
+            teacher_model=teacher_model,
+            final_response_model=final_response_model,
+            allow_legacy_qwen_writer=allow_legacy_qwen_writer,
+        )
         if not errors:
             return spec.index, "already-complete"
         quarantine = output_dir / "production_50x2" / "quarantine" / teacher
@@ -807,6 +836,7 @@ def generate_spec(
         command = _command(
             spec=spec,
             teacher_model=teacher_model,
+            final_response_model=final_response_model,
             output=output,
             usage=usage,
             archive=archive,
@@ -854,7 +884,13 @@ def generate_spec(
                 )
         if _row_count(output) == 1:
             row = next(_read_jsonl(output))
-            errors = validate_row(row, spec=spec, teacher_model=teacher_model)
+            errors = validate_row(
+                row,
+                spec=spec,
+                teacher_model=teacher_model,
+                final_response_model=final_response_model,
+                allow_legacy_qwen_writer=allow_legacy_qwen_writer,
+            )
             if not errors:
                 return spec.index, f"accepted-a{attempt}"
             quarantine = base / "quarantine" / teacher
@@ -865,7 +901,12 @@ def generate_spec(
 
 
 def _collect(
-    *, output_dir: Path, teacher: str, specs: list[Spec]
+    *,
+    output_dir: Path,
+    teacher: str,
+    specs: list[Spec],
+    final_response_model: str,
+    allow_legacy_qwen_writer: bool,
 ) -> tuple[list[dict[str, Any]], list[int]]:
     rows: list[dict[str, Any]] = []
     missing: list[int] = []
@@ -879,7 +920,13 @@ def _collect(
                 missing.append(spec.index)
                 continue
             row = next(_read_jsonl(path))
-        errors = validate_row(row, spec=spec, teacher_model=model)
+        errors = validate_row(
+            row,
+            spec=spec,
+            teacher_model=model,
+            final_response_model=final_response_model,
+            allow_legacy_qwen_writer=allow_legacy_qwen_writer,
+        )
         if errors:
             missing.append(spec.index)
             continue
@@ -893,12 +940,22 @@ def _write_status(
     specs: list[Spec],
     *,
     target_accepted: int = 50,
+    final_response_model: str = QWEN_WRITER,
+    allow_legacy_qwen_writer: bool = False,
 ) -> dict[str, Any]:
-    rows, missing = _collect(output_dir=output_dir, teacher=teacher, specs=specs)
+    rows, missing = _collect(
+        output_dir=output_dir,
+        teacher=teacher,
+        specs=specs,
+        final_response_model=final_response_model,
+        allow_legacy_qwen_writer=allow_legacy_qwen_writer,
+    )
     calls = [len(_actual_tools(row)) for row in rows]
     status = {
         "teacher": teacher,
         "model": TEACHERS[teacher],
+        "response_writer_model": final_response_model,
+        "legacy_qwen_rows_allowed": allow_legacy_qwen_writer,
         "accepted": len(rows),
         "target_accepted": target_accepted,
         "missing_indices": missing,
@@ -947,6 +1004,16 @@ def main() -> int:
         "--symbolic-mode",
         choices=("turnwise", "whole-episode"),
         default="turnwise",
+    )
+    parser.add_argument(
+        "--response-writer",
+        choices=("qwen", "teacher"),
+        default="qwen",
+        help=(
+            "Write all assistant turn responses with the in-cluster Qwen "
+            "model or reuse the selected teacher. Grounding always remains "
+            "on the teacher."
+        ),
     )
     parser.add_argument(
         "--drop-companion-category",
@@ -1022,7 +1089,10 @@ def main() -> int:
         return 0
     if not os.getenv("OPENAI_API_KEY") or not os.getenv("OPENAI_API_BASE"):
         raise RuntimeError("OPENAI_API_KEY and OPENAI_API_BASE must be set")
-    if not os.getenv("LLM_PROXY_URL") or not os.getenv("LLM_PROXY_MASTER_KEY"):
+    if args.response_writer == "qwen" and (
+        not os.getenv("LLM_PROXY_URL")
+        or not os.getenv("LLM_PROXY_MASTER_KEY")
+    ):
         raise RuntimeError("LLM_PROXY_URL and LLM_PROXY_MASTER_KEY must be set")
     if not 1 <= args.target_accepted <= 500:
         raise ValueError("--target-accepted must be between 1 and 500")
@@ -1126,11 +1196,17 @@ def main() -> int:
     failed_any = False
     for teacher in teachers:
         model = TEACHERS[teacher]
+        final_response_model = (
+            model if args.response_writer == "teacher" else QWEN_WRITER
+        )
+        allow_legacy_qwen_writer = args.response_writer == "teacher"
         status = _write_status(
             output_dir,
             teacher,
             specs,
             target_accepted=args.target_accepted,
+            final_response_model=final_response_model,
+            allow_legacy_qwen_writer=allow_legacy_qwen_writer,
         )
         pending = [
             spec
@@ -1140,6 +1216,8 @@ def main() -> int:
                 output_dir,
                 teacher=teacher,
                 teacher_model=model,
+                final_response_model=final_response_model,
+                allow_legacy_qwen_writer=allow_legacy_qwen_writer,
                 spec=spec,
             )
         ]
@@ -1189,6 +1267,8 @@ def main() -> int:
                         spec=spec,
                         teacher=teacher,
                         teacher_model=model,
+                        final_response_model=final_response_model,
+                        allow_legacy_qwen_writer=allow_legacy_qwen_writer,
                         output_dir=output_dir,
                         registry=registry,
                         symbolic_mode=args.symbolic_mode,
@@ -1236,6 +1316,8 @@ def main() -> int:
                             teacher,
                             specs,
                             target_accepted=args.target_accepted,
+                            final_response_model=final_response_model,
+                            allow_legacy_qwen_writer=allow_legacy_qwen_writer,
                         )
                         budget = budget_snapshot()
                         _atomic_json(production / "budget_status.json", budget)
@@ -1267,6 +1349,8 @@ def main() -> int:
             teacher,
             specs,
             target_accepted=args.target_accepted,
+            final_response_model=final_response_model,
+            allow_legacy_qwen_writer=allow_legacy_qwen_writer,
         )
         if status["accepted"] < args.target_accepted:
             failed_any = True
