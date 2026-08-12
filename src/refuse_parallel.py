@@ -310,6 +310,91 @@ Respond only with JSON:
             "protected_tokens_preserved": True,
         }
 
+    def _validate_missing_argument_witness(
+        self,
+        *,
+        result: Dict[str, Any],
+        query: str,
+        original_query: str,
+        source_expected_tools: Sequence[str],
+        policy_history: Sequence[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Deterministically prove the concrete omission proposed by the LLM.
+
+        The semantic judge remains useful for plan continuity, but it has
+        occasionally called an explicitly available operation unavailable or
+        ambiguous. Missing-argument rows therefore carry a mechanically
+        checkable witness: a real source-plan tool, one required no-default
+        field, and the exact source-query text that was removed.
+        """
+        target_tool = str(result.get("target_tool", "")).strip()
+        argument_name = str(
+            result.get("missing_required_argument", "")
+        ).strip()
+        removed_text = str(result.get("removed_value_text", "")).strip()
+        issue_codes: List[str] = []
+        if target_tool not in set(source_expected_tools):
+            issue_codes.append("WITNESS_TOOL_NOT_IN_SOURCE_PLAN")
+        if not self.tool_manager.tool_exists(target_tool):
+            issue_codes.append("WITNESS_TOOL_NOT_AVAILABLE")
+            schema: Dict[str, Any] = {}
+        else:
+            schema = self.tool_manager.get_tool_schema(target_tool)
+        parameters = schema.get("parameters", {}) if schema else {}
+        required = parameters.get("required", [])
+        properties = parameters.get("properties", {})
+        argument_schema = properties.get(argument_name, {})
+        if argument_name not in required:
+            issue_codes.append("WITNESS_ARGUMENT_NOT_REQUIRED")
+        if isinstance(argument_schema, dict) and "default" in argument_schema:
+            issue_codes.append("WITNESS_ARGUMENT_HAS_DEFAULT")
+        if not removed_text or len(removed_text) > 240:
+            issue_codes.append("WITNESS_REMOVED_TEXT_INVALID")
+        else:
+            source_text = str(original_query).casefold()
+            blocked_text = str(query).casefold()
+            witness_text = removed_text.casefold()
+            history_text = json.dumps(
+                list(policy_history),
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            ).casefold()
+            if witness_text not in source_text:
+                issue_codes.append("WITNESS_NOT_IN_SOURCE_QUERY")
+            if witness_text in blocked_text:
+                issue_codes.append("WITNESS_STILL_IN_BLOCKED_QUERY")
+            if witness_text in history_text:
+                issue_codes.append("WITNESS_AVAILABLE_IN_HISTORY")
+        return {
+            "passed": not issue_codes,
+            "issue_codes": issue_codes,
+            "target_tool": target_tool,
+            "missing_required_argument": argument_name,
+            "removed_value_text": removed_text,
+            "required_without_default": (
+                argument_name in required
+                and isinstance(argument_schema, dict)
+                and "default" not in argument_schema
+            ),
+            "removed_from_source_query": bool(
+                removed_text
+                and removed_text.casefold()
+                in str(original_query).casefold()
+                and removed_text.casefold() not in str(query).casefold()
+            ),
+            "absent_from_prior_history": bool(
+                removed_text
+                and removed_text.casefold()
+                not in json.dumps(
+                    list(policy_history),
+                    ensure_ascii=False,
+                    default=str,
+                    separators=(",", ":"),
+                ).casefold()
+            ),
+        }
+
     # ------------------------------------------------------------------
     # Policy tool contracts
     # ------------------------------------------------------------------
@@ -600,6 +685,13 @@ response that should be produced with NO real tool call.
 7. When FIXED UNDERLYING PLAN is non-empty, the blocked request must still ask
    for exactly that operation. If the omitted/ambiguous fact were supplied, the
    same listed tool sequence—not a different available tool—would fulfill it.
+8. For missing_argument with a fixed plan, also return a deterministic omission
+   witness. target_tool must be one tool in FIXED UNDERLYING PLAN;
+   missing_required_argument must be a required no-default schema field; and
+   removed_value_text must be one exact, verbatim substring from OPTIONAL
+   ORIGINAL TURN that you removed from the blocked query. It must not occur in
+   PRIOR POLICY-VISIBLE HISTORY. Do not put the removed value in the assistant
+   response.
 
 {hard_rules}
 
@@ -607,12 +699,18 @@ Respond only with JSON:
 {{
   "query": "...",
   "intent": "...",
-  "assistant_response": "..."
+  "assistant_response": "...",
+  "target_tool": "required for missing_argument, otherwise empty",
+  "missing_required_argument": "required for missing_argument, otherwise empty",
+  "removed_value_text": "exact removed source substring, otherwise empty"
 }}
 """
         try:
             result = self._extract_json_object(
-                self._safe_llm_generate([{"role": "user", "content": prompt}])
+                self._safe_llm_generate(
+                    [{"role": "user", "content": prompt}],
+                    purpose="refusal_query_generate",
+                )
             )
         except Exception as exc:
             print(f"  Refusal query generation failed: {exc}")
@@ -638,6 +736,31 @@ Respond only with JSON:
             return None
         query, naturalization = naturalized
 
+        deterministic_witness: Optional[Dict[str, Any]] = None
+        if (
+            refusal_type == "missing_argument"
+            and original_query
+            and source_expected_tools
+        ):
+            deterministic_witness = self._validate_missing_argument_witness(
+                result=result,
+                query=query,
+                original_query=original_query,
+                source_expected_tools=source_expected_tools,
+                policy_history=policy_history or [],
+            )
+            if not deterministic_witness.get("passed", False):
+                print(
+                    "  Deterministic missing-argument witness failed: "
+                    + ", ".join(
+                        deterministic_witness.get("issue_codes", [])
+                    )
+                )
+                return None
+        elif refusal_type == "missing_argument" and hard_mode:
+            print("  Hard missing-argument refusal lacks a source-plan witness")
+            return None
+
         certificate = self._certify_refusal(
             query=query,
             refusal_type=refusal_type,
@@ -654,6 +777,10 @@ Respond only with JSON:
             )
             return None
         certificate["query_naturalization"] = naturalization
+        if deterministic_witness is not None:
+            certificate["deterministic_missing_argument_witness"] = (
+                deterministic_witness
+            )
 
         quality = {
             "passed": True,
@@ -794,6 +921,7 @@ Respond only with JSON:
                 self._safe_llm_generate(
                     [{"role": "user", "content": prompt}],
                     llm=self.judge,
+                    purpose="refusal_semantic_judge",
                 )
             )
             raw_valid = result.get("is_valid")
@@ -1665,6 +1793,50 @@ Respond only with JSON:
         max_retries: int,
         initial_execution_context: Optional[Dict[str, Any]],
     ) -> Tuple[Optional[List[TrajectoryStep]], Optional[Dict[str, Any]]]:
+        """Execute one batch with at most one whole-batch repair.
+
+        Argument generation previously had an inner retry, but a schema-valid
+        argument set that failed deterministic execution/order checks discarded
+        the complete episode immediately.  Treat the parallel batch as the
+        transactional turn: restore its pre-turn snapshot and regenerate the
+        whole batch once, without exposing failed values or simulator details.
+        """
+        pre_turn_state = self.tool_manager.get_api_state()
+        attempts = max(1, min(self.max_turn_attempts, max_retries))
+        for attempt in range(attempts):
+            self.tool_manager.restore_api_state(copy.deepcopy(pre_turn_state))
+            try:
+                result = self._execute_parallel_batch_once(
+                    query_result=query_result,
+                    # One compilation per turn attempt; the wrapper owns the
+                    # single repair and prevents nested retry amplification.
+                    max_retries=1,
+                    initial_execution_context=initial_execution_context,
+                )
+            except Exception as exc:
+                print(
+                    "  Parallel batch attempt "
+                    f"{attempt + 1}/{attempts} failed deterministically "
+                    f"({type(exc).__name__})"
+                )
+                result = (None, None)
+            if result[0] is not None:
+                return result
+            if attempt + 1 < attempts:
+                print(
+                    "  Retrying the complete parallel batch from its "
+                    "pre-turn snapshot"
+                )
+        self.tool_manager.restore_api_state(copy.deepcopy(pre_turn_state))
+        return None, None
+
+    def _execute_parallel_batch_once(
+        self,
+        *,
+        query_result: FeatureQueryGenerationResult,
+        max_retries: int,
+        initial_execution_context: Optional[Dict[str, Any]],
+    ) -> Tuple[Optional[List[TrajectoryStep]], Optional[Dict[str, Any]]]:
         if not self._python_tools_available:
             print("  Parallel generation requires executable Python tools")
             return None, None
@@ -2340,7 +2512,10 @@ Respond only with JSON:
 """
         try:
             result = self._extract_json_object(
-                self._safe_llm_generate([{"role": "user", "content": prompt}])
+                self._safe_llm_generate(
+                    [{"role": "user", "content": prompt}],
+                    purpose="blueprint_naturalize",
+                )
             )
         except Exception as exc:
             print(f"  Blueprint naturalization failed: {exc}")
@@ -2496,7 +2671,21 @@ Respond only with JSON:
         history: List[Dict[str, Any]],
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
         source_query = str(pending["source_query"])
-        protected = self._protected_query_tokens(source_query)
+        witness = pending.get("deterministic_missing_argument_witness", {})
+        removed_text = (
+            str(witness.get("removed_value_text", "")).strip()
+            if isinstance(witness, dict) and witness.get("passed") is True
+            else ""
+        )
+        # The blocked request is already policy-visible. A natural recovery
+        # reply only needs to supply the one mechanically proven omission; the
+        # previous implementation required the user to repeat every number and
+        # entity from the complete source request.
+        protected = (
+            [removed_text]
+            if removed_text
+            else self._protected_query_tokens(source_query)
+        )
         expected_tools = list(pending["expected_tools"])
         contracts = [
             self.tool_manager.get_tool_schema(name)
@@ -2529,6 +2718,8 @@ fact or choose the intended interpretation, briefly confirm the original goal,
 and contain everything needed for the fixed executable plan. Do not mention
 tools, APIs, schemas, argument names, or that this is a benchmark. Do not add
 any operation or value not present in the fully specified source request.
+The blocked request remains visible in conversation history, so do not repeat
+facts it already contains. Preserve every SOURCE TOKEN listed below verbatim.
 
 Few-shot examples:
 
@@ -2545,7 +2736,10 @@ Respond only with JSON:
 """
         try:
             result = self._extract_json_object(
-                self._safe_llm_generate([{"role": "user", "content": prompt}])
+                self._safe_llm_generate(
+                    [{"role": "user", "content": prompt}],
+                    purpose="clarification_recovery_generate",
+                )
             )
         except Exception as exc:
             print(f"  Clarification recovery generation failed: {exc}")
@@ -2571,8 +2765,55 @@ Respond only with JSON:
             "protected_tokens_preserved": True,
         }
 
-    @staticmethod
+    @classmethod
+    def _compact_history_value(
+        cls,
+        value: Any,
+        *,
+        depth: int = 0,
+    ) -> Any:
+        """Bound feature prompts while retaining useful policy-visible facts.
+
+        The saved trajectory still contains complete tool outputs. Feature
+        proposal/certification only needs a compact view of those same visible
+        results; repeatedly embedding airport catalogs, message searches, and
+        full file listings made later turns exceed 100k tokens. Values retained
+        here are copied verbatim and therefore cannot introduce hidden state.
+        """
+        if depth >= 4:
+            if isinstance(value, (dict, list)):
+                return {"__omitted_nested_value__": True}
+            return copy.deepcopy(value)
+        if isinstance(value, dict):
+            items = list(value.items())
+            compact = {
+                str(key): cls._compact_history_value(
+                    child,
+                    depth=depth + 1,
+                )
+                for key, child in items[:24]
+            }
+            if len(items) > 24:
+                compact["__omitted_fields__"] = len(items) - 24
+            return compact
+        if isinstance(value, list):
+            compact_list = [
+                cls._compact_history_value(
+                    child,
+                    depth=depth + 1,
+                )
+                for child in value[:8]
+            ]
+            if len(value) > 8:
+                compact_list.append({"__omitted_items__": len(value) - 8})
+            return compact_list
+        if isinstance(value, str) and len(value) > 600:
+            return value[:600] + f"…[omitted {len(value) - 600} chars]"
+        return copy.deepcopy(value)
+
+    @classmethod
     def _conversation_policy_history(
+        cls,
         conversation: MultiTurnConversation,
     ) -> List[Dict[str, Any]]:
         history: List[Dict[str, Any]] = []
@@ -2585,19 +2826,26 @@ Respond only with JSON:
                             "role": "assistant_tool_call",
                             "call_id": f"t{turn.turn_number}s{step.step_number}c{call_index}",
                             "name": call.tool_name,
-                            "arguments": call.arguments,
+                            "arguments": cls._compact_history_value(
+                                call.arguments
+                            ),
                         }
                     )
                     history.append(
                         {
                             "role": "tool",
                             "name": call.tool_name,
-                            "content": call.output,
+                            "content": cls._compact_history_value(call.output),
                         }
                     )
             if turn.assistant_response:
                 history.append(
-                    {"role": "assistant", "content": turn.assistant_response}
+                    {
+                        "role": "assistant",
+                        "content": cls._compact_history_value(
+                            turn.assistant_response
+                        ),
+                    }
                 )
         return history
 
@@ -2686,6 +2934,22 @@ Respond only with JSON:
             print("  Required final-turn feature is not eligible")
             return None
 
+        # Feature generation and certification must see exactly the same tool
+        # family as the policy. Passing None here exposed all 129 schemas to a
+        # refusal judge even though the saved row contained only the focus
+        # category, causing both false counterexamples and very large prompts.
+        feature_categories = {
+            self.tool_manager.get_tool_category(name)
+            for name in turn_spec.get("expected_tools", [])
+            if self.tool_manager.tool_exists(name)
+        }
+        feature_categories.discard(None)
+        feature_focus_category = (
+            next(iter(feature_categories))
+            if len(feature_categories) == 1
+            else None
+        )
+
         interactive_refusal = (
             interactive_index is not None and turn_index == interactive_index
         )
@@ -2714,7 +2978,7 @@ Respond only with JSON:
                 else:
                     reason = self._sample_refusal_reason()
                 result = self._generate_refusal_query(
-                    focus_category=None,
+                    focus_category=feature_focus_category,
                     refusal_type=reason,
                     policy_history=history,
                     original_query=original_query,
@@ -2748,6 +3012,14 @@ Respond only with JSON:
                             "assistant_response": (
                                 result.native_response or ""
                             ),
+                            "deterministic_missing_argument_witness": (
+                                copy.deepcopy(
+                                    result.feature_certificate.get(
+                                        "deterministic_missing_argument_witness",
+                                        {},
+                                    )
+                                )
+                            ),
                         }
                     return result
             if required_mode == "refusal" or interactive_refusal:
@@ -2770,13 +3042,6 @@ Respond only with JSON:
             )
         )
         if try_parallel:
-            categories = {
-                self.tool_manager.get_tool_category(name)
-                for name in turn_spec.get("expected_tools", [])
-                if self.tool_manager.tool_exists(name)
-            }
-            categories.discard(None)
-            focus_category = next(iter(categories)) if len(categories) == 1 else None
             current_state = (
                 self.tool_manager.get_api_state()
                 if self._python_tools_available
@@ -2784,7 +3049,7 @@ Respond only with JSON:
             )
             for _ in range(self.max_turn_attempts):
                 result = self._generate_parallel_query(
-                    focus_category=focus_category,
+                    focus_category=feature_focus_category,
                     num_calls=self.num_actions,
                     initial_api_state=current_state,
                     policy_history=history,

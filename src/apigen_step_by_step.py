@@ -3860,9 +3860,35 @@ Respond ONLY with valid JSON:
         # 1. Check tool relevance
         tool_relevance_checks = []
         all_relevant = True
+        query_check = query_quality or {"passed": True, "issue_codes": []}
+        parallel_certificate = query_check.get("parallel_certificate", {})
+        certified_parallel_query = (
+            query_check.get("passed") is True
+            and query_check.get("mode") == "parallel"
+            and isinstance(parallel_certificate, dict)
+            and parallel_certificate.get("passed") is True
+        )
         for step in trajectory:
             for tc in step.tool_calls:
-                check = self.verify_tool_relevance(query, tc.tool_name, step)
+                if certified_parallel_query:
+                    # The feature certifier sees the full query, exact planned
+                    # call set, and complete tool schemas. The old token-overlap
+                    # heuristic rejects natural paraphrases such as "how much
+                    # is USD in JPY" for compute_exchange_rate even after that
+                    # stronger episode-level check has passed.
+                    check = {
+                        "tool_name": tc.tool_name,
+                        "is_relevant": True,
+                        "relevance_score": 1.0,
+                        "reasoning": (
+                            "Certified by the episode-level parallel query "
+                            "certificate."
+                        ),
+                    }
+                else:
+                    check = self.verify_tool_relevance(
+                        query, tc.tool_name, step
+                    )
                 tool_relevance_checks.append(check)
                 if not check['is_relevant']:
                     all_relevant = False
@@ -3901,7 +3927,6 @@ Respond ONLY with valid JSON:
             check.get("passed", False) for check in transition_checks
         ) if transition_checks else True
 
-        query_check = query_quality or {"passed": True, "issue_codes": []}
         final_check = (
             dict(self._last_final_response_quality)
             if final_response is not None

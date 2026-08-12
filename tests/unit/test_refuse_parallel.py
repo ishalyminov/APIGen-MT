@@ -179,6 +179,84 @@ def test_refusal_certifier_fails_closed_when_judge_is_unavailable():
     assert certificate["issue_codes"] == ["REFUSAL_CERTIFIER_UNAVAILABLE"]
 
 
+def test_missing_argument_witness_is_deterministic_and_history_closed():
+    manager = ReadOnlyManager()
+    llm = QueueLLM()
+    generator = RefusalParallelStepByStepGenerator(
+        llm_client=llm,
+        judge_client=llm,
+        tool_manager=manager,
+        num_actions=2,
+        allow_refusal=True,
+    )
+    proposal = {
+        "target_tool": "lookup",
+        "missing_required_argument": "key",
+        "removed_value_text": "alpha",
+    }
+    witness = generator._validate_missing_argument_witness(
+        result=proposal,
+        query="Please look up the value for me.",
+        original_query="Please look up alpha for me.",
+        source_expected_tools=["lookup"],
+        policy_history=[],
+    )
+    assert witness["passed"] is True
+    assert witness["required_without_default"] is True
+    assert witness["removed_from_source_query"] is True
+    assert witness["absent_from_prior_history"] is True
+
+    leaked = generator._validate_missing_argument_witness(
+        result=proposal,
+        query="Please look up the value for me.",
+        original_query="Please look up alpha for me.",
+        source_expected_tools=["lookup"],
+        policy_history=[{"role": "user", "content": "The key is alpha."}],
+    )
+    assert leaked["passed"] is False
+    assert "WITNESS_AVAILABLE_IN_HISTORY" in leaked["issue_codes"]
+
+
+def test_recovery_only_repeats_the_proven_missing_value():
+    manager = ReadOnlyManager()
+    llm = QueueLLM(
+        responses=[
+            json.dumps(
+                {"query": "Use 20-liter bucket capacity, please; go ahead."}
+            )
+        ]
+    )
+    generator = RefusalParallelMultiTurnGenerator(
+        llm_client=llm,
+        judge_client=llm,
+        tool_manager=manager,
+        num_turns=5,
+        actions_per_turn=2,
+        allow_refusal=True,
+    )
+    query, certificate = generator._generate_clarification_recovery_query(
+        pending={
+            "source_query": (
+                "Convert 12.5 liters and compare it with the "
+                "20-liter bucket capacity."
+            ),
+            "refusal_query": "Convert 12.5 liters and compare it with the bucket.",
+            "assistant_response": "What is the bucket capacity?",
+            "expected_tools": ["lookup"],
+            "reason": "missing_argument",
+            "deterministic_missing_argument_witness": {
+                "passed": True,
+                "removed_value_text": "20-liter bucket capacity",
+            },
+        },
+        history=[],
+    )
+    assert "20-liter bucket capacity" in query
+    assert "12.5" not in query
+    assert certificate["protected_tokens"] == ["20-liter bucket capacity"]
+    assert certificate["protected_tokens_preserved"] is True
+
+
 
 
 
@@ -406,6 +484,81 @@ def test_parallel_batch_rejects_state_mutation_and_rolls_back():
     assert manager.get_api_state() == before
 
 
+def test_parallel_batch_repairs_once_from_pre_turn_snapshot():
+    manager = ReadOnlyManager()
+    generator = FixedParallelGenerator(calls=[], manager=manager)
+    attempts = iter(
+        [
+            [
+                {
+                    "call_id": "p1",
+                    "tool_name": "mutate",
+                    "arguments": {"amount": 1},
+                },
+                {
+                    "call_id": "p2",
+                    "tool_name": "lookup",
+                    "arguments": {"key": "beta"},
+                },
+            ],
+            [
+                {
+                    "call_id": "p1",
+                    "tool_name": "lookup",
+                    "arguments": {"key": "alpha"},
+                },
+                {
+                    "call_id": "p2",
+                    "tool_name": "lookup",
+                    "arguments": {"key": "beta"},
+                },
+            ],
+        ]
+    )
+    generator._generate_parallel_arguments = lambda **kwargs: next(attempts)
+    before = manager.get_api_state()
+    steps, _ = generator._execute_parallel_batch(
+        query_result=parallel_result(["lookup", "lookup"]),
+        max_retries=2,
+        initial_execution_context={},
+    )
+    assert len(steps) == 1
+    assert [call.tool_name for call in steps[0].tool_calls] == [
+        "lookup",
+        "lookup",
+    ]
+    assert manager.get_api_state() == before
+
+
+def test_certified_parallel_relevance_replaces_lexical_overlap_heuristic():
+    manager = ReadOnlyManager()
+    calls = [
+        {"call_id": "p1", "tool_name": "lookup", "arguments": {"key": "alpha"}},
+        {"call_id": "p2", "tool_name": "lookup", "arguments": {"key": "beta"}},
+    ]
+    generator = FixedParallelGenerator(calls=calls, manager=manager)
+    steps, context = generator._execute_parallel_batch(
+        query_result=parallel_result(["lookup", "lookup"]),
+        max_retries=1,
+        initial_execution_context={},
+    )
+    verification = generator.run_full_verification(
+        query="Please handle both of those for the comparison.",
+        trajectory=steps,
+        execution_context=context,
+        query_quality={
+            "passed": True,
+            "mode": "parallel",
+            "parallel_certificate": {"passed": True},
+        },
+    )
+    assert verification.overall_verification_passed is True
+    assert all(
+        check["reasoning"].startswith("Certified by the episode-level")
+        for check in verification.tool_relevance_checks
+    )
+
+
 def test_strict_argument_schema_rejects_unknown_and_wrong_type():
     manager = ReadOnlyManager()
     llm = QueueLLM()
@@ -528,6 +681,9 @@ def test_multi_turn_final_refusal_is_generated_without_touching_blueprint_tools(
                 "query": "Look this up, but I did not provide the required key.",
                 "intent": "Lookup",
                 "assistant_response": "Which lookup key should I use?",
+                "target_tool": "lookup",
+                "missing_required_argument": "key",
+                "removed_value_text": "alpha",
             }),
             json.dumps(
                 {
