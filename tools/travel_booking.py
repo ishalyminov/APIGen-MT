@@ -11,10 +11,100 @@ from typing import List, Dict, Any, Optional, Tuple
 class TravelBooking:
     """Travel booking system for managing flights, credit cards, and budgets."""
 
+    _AIRPORTS: Dict[str, str] = {
+        'Rivermist': 'RVM',
+        'Stonebrook': 'STB',
+        'Maplecrest': 'MPC',
+        'Silverpine': 'SLP',
+        'Shadowridge': 'SHR',
+        'London': 'LHR',
+        'Paris': 'CDG',
+        'Sunset Valley': 'SSV',
+        'Oakendale': 'OKD',
+        'Willowbend': 'WLB',
+        'Crescent Hollow': 'CSH',
+        'Autumnville': 'ATV',
+        'Pinehaven': 'PNH',
+        'Greenfield': 'GRF',
+        'San Francisco': 'SFO',
+        'Los Angeles': 'LAX',
+        'New York': 'JFK',
+        'Chicago': 'ORD',
+        'Boston': 'BOS',
+        'Beijing': 'PEK',
+        'Hong Kong': 'HKG',
+        'Rome': 'FCO',
+        'Tokyo': 'NRT',
+        'Seattle': 'SEA',
+        'Miami': 'MIA',
+        'Dallas': 'DFW',
+        'Atlanta': 'ATL',
+        'Denver': 'DEN',
+        'Phoenix': 'PHX',
+        'Las Vegas': 'LAS',
+        'Orlando': 'MCO',
+        'Honolulu': 'HNL',
+        'Washington D.C.': 'DCA',
+        'Dubai': 'DXB',
+        'Singapore': 'SIN',
+        'Sydney': 'SYD',
+        'Mumbai': 'BOM',
+        'Shanghai': 'PVG',
+        'Toronto': 'YYZ',
+        'Vancouver': 'YVR',
+        'Mexico City': 'MEX',
+        'Sao Paulo': 'GRU',
+        'Amsterdam': 'AMS',
+        'Madrid': 'MAD',
+        'Munich': 'MUC',
+        'Zurich': 'ZRH',
+        'Barcelona': 'BCN',
+        'Milan': 'MXP',
+        'Istanbul': 'IST',
+        'Bangkok': 'BKK',
+        'Jakarta': 'CGK',
+        'Kuala Lumpur': 'KUL',
+        'Manila': 'MNL',
+        'Seoul': 'ICN',
+        'Taipei': 'TPE',
+        'Frankfurt': 'FRA',
+        'Brussels': 'BRU',
+        'Vienna': 'VIE',
+        'Prague': 'PRG',
+        'Stockholm': 'ARN',
+        'Copenhagen': 'CPH',
+        'Oslo': 'OSL',
+        'Helsinki': 'HEL',
+        'Warsaw': 'WAW',
+        'Lisbon': 'LIS',
+        'Dublin': 'DUB',
+        'Athens': 'ATH',
+        'Moscow': 'SVO',
+        'San Diego': 'SAN',
+        'Portland': 'PDX',
+        'Austin': 'AUS',
+        'Nashville': 'BNA',
+        'San Jose': 'SJC',
+        'Tampa': 'TPA',
+        'Raleigh': 'RDU',
+        'Detroit': 'DTW',
+        'Charlotte': 'CLT',
+        'Minneapolis': 'MSP',
+        'Philadelphia': 'PHL',
+        'Baltimore': 'BWI',
+        'Newark': 'EWR',
+        'Fort Lauderdale': 'FLL',
+        'Pittsburgh': 'PIT',
+    }
+
     def __init__(self, initial_config: dict) -> None:
         """Initialize the travel booking system with the given configuration."""
-        self.credit_card_list: Dict[str, Dict[str, Any]] = initial_config.get("credit_card_list", {})
-        self.booking_record: Dict[str, Dict[str, Any]] = initial_config.get("booking_record", {})
+        self.credit_card_list: Dict[str, Dict[str, Any]] = copy.deepcopy(
+            initial_config.get("credit_card_list", {})
+        )
+        self.booking_record: Dict[str, Dict[str, Any]] = copy.deepcopy(
+            initial_config.get("booking_record", {})
+        )
         self.access_token: str = initial_config.get("access_token", "")
         self.token_type: str = initial_config.get("token_type", "Bearer")
         self.token_expires_in: int = initial_config.get("token_expires_in", 0)
@@ -25,6 +115,9 @@ class TravelBooking:
         self.client_id: str = initial_config.get("client_id", "")
         self.client_secret: str = initial_config.get("client_secret", "")
         self.refresh_token: str = initial_config.get("refresh_token", "")
+        # Keep date-sensitive behavior replayable.  The simulation year is
+        # state, not the host machine's wall clock.
+        self.current_year: int = int(initial_config.get("current_year", 2026))
 
     def authenticate_travel(
         self,
@@ -111,7 +204,16 @@ class TravelBooking:
 
         card["balance"] = card.get("balance", 0.0) - travel_cost
 
-        booking_id = f"flight_{len(self.booking_record) + 1:03d}"
+        existing_numbers = []
+        for existing_id in self.booking_record:
+            match = re.fullmatch(r"flight_(\d+)", str(existing_id))
+            if match:
+                existing_numbers.append(int(match.group(1)))
+        next_booking_number = max(existing_numbers, default=0) + 1
+        booking_id = f"flight_{next_booking_number:03d}"
+        while booking_id in self.booking_record:
+            next_booking_number += 1
+            booking_id = f"flight_{next_booking_number:03d}"
         transaction_id = f"txn_{card_id}_{booking_id}"
 
         booking_entry = {
@@ -214,8 +316,9 @@ class TravelBooking:
         self, lastModifiedAfter: str = "None", includeRemoved: str = "None"
     ) -> Dict[str, Any]:
         """Get the budget fiscal year."""
-        current_year = datetime.datetime.now().year
-        return {"budget_fiscal_year": f"{current_year}-{current_year + 1}"}
+        return {
+            "budget_fiscal_year": f"{self.current_year}-{self.current_year + 1}"
+        }
 
     def get_credit_card_balance(
         self, access_token: str, card_id: str
@@ -228,6 +331,54 @@ class TravelBooking:
             return {"card_balance": 0.0}
 
         return {"card_balance": self.credit_card_list[card_id].get("balance", 0.0)}
+
+    def get_all_credit_cards(self) -> Dict[str, Any]:
+        """Return all registered cards with masked card numbers.
+
+        The function has no token argument in the BFCL contract, so it uses the
+        travel session stored on the simulator.  A logged-out session receives
+        an empty list rather than raw card data.
+        """
+        if not self.access_token:
+            return {"logged_in": False, "count": 0, "cards": []}
+
+        cards = []
+        for card_id, card in sorted(self.credit_card_list.items()):
+            raw_number = str(card.get("card_number", ""))
+            digits = "".join(ch for ch in raw_number if ch.isdigit())
+            masked = f"****{digits[-4:]}" if digits else ""
+            cards.append({
+                "card_id": str(card_id),
+                "card_number_masked": masked,
+                "expiration_date": str(
+                    card.get("expiration_date", card.get("expiry_date", card.get("expiry", "")))
+                ),
+                "cardholder_name": str(
+                    card.get("cardholder_name", card.get("card_holder_name", ""))
+                ),
+                "balance": float(card.get("balance", 0.0) or 0.0),
+            })
+        return {"logged_in": True, "count": len(cards), "cards": cards}
+
+    def list_all_airports(self) -> Dict[str, Any]:
+        """List the deterministic airport catalog used by the simulator."""
+        airports = [
+            {"city": city, "code": code}
+            for city, code in sorted(self._AIRPORTS.items(), key=lambda item: item[0].casefold())
+        ]
+        return {"count": len(airports), "airports": airports}
+
+    def travel_get_login_status(self) -> Dict[str, Any]:
+        """Return the current travel-session authentication state."""
+        logged_in = bool(self.access_token and self.token_expires_in > 0)
+        return {
+            "logged_in": logged_in,
+            "user_first_name": self.user_first_name if logged_in else "",
+            "user_last_name": self.user_last_name if logged_in else "",
+            "token_type": self.token_type if logged_in else "",
+            "scope": self.token_scope if logged_in else "",
+            "expires_in": int(self.token_expires_in if logged_in else 0),
+        }
 
     def get_flight_cost(
         self,
@@ -282,94 +433,13 @@ class TravelBooking:
 
     def get_nearest_airport_by_city(self, location: str) -> Dict[str, Any]:
         """Get the nearest airport to the given location."""
-        city_to_airport = {
-            "Rivermist": "RVM",
-            "Stonebrook": "STB",
-            "Maplecrest": "MPC",
-            "Silverpine": "SLP",
-            "Shadowridge": "SHR",
-            "London": "LHR",
-            "Paris": "CDG",
-            "Sunset Valley": "SSV",
-            "Oakendale": "OKD",
-            "Willowbend": "WLB",
-            "Crescent Hollow": "CSH",
-            "Autumnville": "ATV",
-            "Pinehaven": "PNH",
-            "Greenfield": "GRF",
-            "San Francisco": "SFO",
-            "Los Angeles": "LAX",
-            "New York": "JFK",
-            "Chicago": "ORD",
-            "Boston": "BOS",
-            "Beijing": "PEK",
-            "Hong Kong": "HKG",
-            "Rome": "FCO",
-            "Tokyo": "NRT",
-            "Seattle": "SEA",
-            "Miami": "MIA",
-            "Dallas": "DFW",
-            "Atlanta": "ATL",
-            "Denver": "DEN",
-            "Phoenix": "PHX",
-            "Las Vegas": "LAS",
-            "Orlando": "MCO",
-            "Honolulu": "HNL",
-            "Washington D.C.": "DCA",
-            "Dubai": "DXB",
-            "Singapore": "SIN",
-            "Sydney": "SYD",
-            "Mumbai": "BOM",
-            "Shanghai": "PVG",
-            "Toronto": "YYZ",
-            "Vancouver": "YVR",
-            "Mexico City": "MEX",
-            "Sao Paulo": "GRU",
-            "Amsterdam": "AMS",
-            "Madrid": "MAD",
-            "Munich": "MUC",
-            "Zurich": "ZRH",
-            "Barcelona": "BCN",
-            "Milan": "MXP",
-            "Istanbul": "IST",
-            "Bangkok": "BKK",
-            "Jakarta": "CGK",
-            "Kuala Lumpur": "KUL",
-            "Manila": "MNL",
-            "Seoul": "ICN",
-            "Taipei": "TPE",
-            "Frankfurt": "FRA",
-            "Brussels": "BRU",
-            "Vienna": "VIE",
-            "Prague": "PRG",
-            "Stockholm": "ARN",
-            "Copenhagen": "CPH",
-            "Oslo": "OSL",
-            "Helsinki": "HEL",
-            "Warsaw": "WAW",
-            "Lisbon": "LIS",
-            "Dublin": "DUB",
-            "Athens": "ATH",
-            "Moscow": "SVO",
-            "San Diego": "SAN",
-            "Portland": "PDX",
-            "Austin": "AUS",
-            "Nashville": "BNA",
-            "San Jose": "SJC",
-            "Tampa": "TPA",
-            "Raleigh": "RDU",
-            "Detroit": "DTW",
-            "Charlotte": "CLT",
-            "Minneapolis": "MSP",
-            "Philadelphia": "PHL",
-            "Baltimore": "BWI",
-            "Newark": "EWR",
-            "Fort Lauderdale": "FLL",
-            "Pittsburgh": "PIT",
-        }
+        city_to_airport = self._AIRPORTS
         nearest_airport = city_to_airport.get(location, "")
-        if not nearest_airport and location:
-            nearest_airport = location.upper()[:3]
+        if not nearest_airport:
+            return {
+                "nearest_airport": "",
+                "error": f"No airport mapping is available for '{location}'.",
+            }
         return {"nearest_airport": nearest_airport}
 
     def purchase_insurance(
@@ -412,7 +482,16 @@ class TravelBooking:
         if not access_token or access_token != self.access_token:
             return {"card_id": ""}
 
-        card_id = f"card_{card_number[-4:]}"
+        base_card_id = f"card_{card_number[-4:]}"
+        card_id = base_card_id
+        suffix = 2
+        while card_id in self.credit_card_list:
+            existing = self.credit_card_list[card_id]
+            if existing.get("card_number") == card_number:
+                return {"card_id": card_id, "status": "already_registered"}
+            card_id = f"{base_card_id}_{suffix}"
+            suffix += 1
+
         self.credit_card_list[card_id] = {
             "card_number": card_number,
             "expiration_date": expiration_date,
@@ -458,8 +537,8 @@ class TravelBooking:
         self,
         first_name: str,
         last_name: str,
-        date_of_birth: str = "",
-        passport_number: str = "",
+        date_of_birth: str,
+        passport_number: str,
     ) -> Dict[str, Any]:
         """Verify the traveler information."""
         if not first_name or not last_name:
@@ -469,13 +548,13 @@ class TravelBooking:
             }
         if not date_of_birth:
             return {
-                "verification_status": True,
-                "verification_message": "Traveler information verified (date of birth skipped).",
+                "verification_status": False,
+                "verification_failure": "Date of birth cannot be empty.",
             }
         if not passport_number:
             return {
-                "verification_status": True,
-                "verification_message": "Traveler information verified (passport number skipped).",
+                "verification_status": False,
+                "verification_failure": "Passport number cannot be empty.",
             }
 
         try:

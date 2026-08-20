@@ -13,38 +13,67 @@ class TradingBot:
 
     def __init__(self, initial_config: dict) -> None:
         """Initialize the trading bot with the provided configuration."""
-        self.account_info: dict = initial_config.get("account_info", {
+        self.account_info: dict = copy.deepcopy(initial_config.get("account_info", {
             "account_id": 0,
             "balance": 0.0,
             "binding_card": 0
-        })
+        }))
         self.authenticated: bool = initial_config.get("authenticated", False)
         self.current_user: str = initial_config.get("current_user", "")
         self.market_status: str = initial_config.get("market_status", "Closed")
-        self.order_counter: int = initial_config.get("order_counter", 0)
-        self.stocks: Dict[str, Dict[str, Any]] = initial_config.get("stocks", {})
-        self.watch_list: List[str] = initial_config.get("watch_list", [])
+        configured_order_counter = int(initial_config.get("order_counter", 0) or 0)
+        self.order_counter: int = configured_order_counter
+        self.stocks: Dict[str, Dict[str, Any]] = copy.deepcopy(initial_config.get("stocks", {}))
+        self.watch_list: List[str] = list(initial_config.get("watch_list", []))
         self.username: str = initial_config.get("username", "")
         self.password: str = initial_config.get("password", "")
+        # A simulator-owned clock keeps replay deterministic.  It is advanced
+        # only by explicit tool calls such as ``update_market_status``.
+        self.current_time: str = str(
+            initial_config.get("current_time", "2024-11-05 10:00:00")
+        )
         
-        raw_history = initial_config.get("transaction_history", [])
-        self.transaction_history: List[Dict[str, Any]] = []
-        for item in raw_history:
-            clean_item = {k: v for k, v in item.items() if k != "order_id"}
-            self.transaction_history.append(clean_item)
-            
+        raw_history = copy.deepcopy(initial_config.get("transaction_history", []))
+        self.transaction_history: List[Dict[str, Any]] = raw_history
+
+        # A serialized simulator snapshot contains an explicit orders table,
+        # while older seed configs may encode orders only in transaction history.
+        # Support both so replay does not silently lose existing identifiers.
         self.orders: Dict[int, Dict[str, Any]] = {}
+        for raw_id, raw_order in copy.deepcopy(initial_config.get("orders", {})).items():
+            try:
+                order_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            order = dict(raw_order) if isinstance(raw_order, dict) else {}
+            order.setdefault("id", order_id)
+            self.orders[order_id] = order
+
         for item in raw_history:
             if "order_id" in item:
-                order_id = item["order_id"]
-                self.orders[order_id] = {
+                try:
+                    order_id = int(item["order_id"])
+                except (TypeError, ValueError):
+                    continue
+                self.orders.setdefault(order_id, {
                     "id": order_id,
-                    "order_type": item.get("order_type", "Buy"),
+                    "order_type": item.get("order_type", item.get("type", "Buy")),
                     "symbol": item.get("symbol", ""),
                     "price": item.get("price", 0.0),
                     "amount": item.get("num_shares", item.get("amount", 0)),
-                    "status": item.get("status", "Pending")
-                }
+                    "status": item.get("status", "Pending"),
+                })
+
+        existing_order_ids = []
+        for order_id in self.orders:
+            try:
+                existing_order_ids.append(int(order_id))
+            except (TypeError, ValueError):
+                pass
+        self.order_counter = max(
+            configured_order_counter,
+            max(existing_order_ids, default=0),
+        )
                 
         self.sector_mapping: Dict[str, List[str]] = {
             "Technology": ["AAPL", "GOOG", "MSFT", "NVDA"],
@@ -206,6 +235,87 @@ class TradingBot:
                 })
         return {"transaction_history": result}
 
+    def get_account_info(self) -> Dict[str, Any]:
+        """Return account information for the authenticated user."""
+        if not self.authenticated:
+            return {
+                "authenticated": False,
+                "account_id": 0,
+                "balance": 0.0,
+                "binding_card": 0,
+            }
+        return {
+            "authenticated": True,
+            "account_id": int(self.account_info.get("account_id", 0) or 0),
+            "balance": float(self.account_info.get("balance", 0.0) or 0.0),
+            "binding_card": int(self.account_info.get("binding_card", 0) or 0),
+        }
+
+    def get_current_time(self) -> Dict[str, Any]:
+        """Return the deterministic simulator clock and market status."""
+        return {
+            "current_time": self.current_time,
+            "market_status": self.market_status,
+        }
+
+    def get_order_history(self) -> Dict[str, Any]:
+        """Return all orders in stable ascending order-ID order."""
+        if not self.authenticated:
+            return {
+                "authenticated": False,
+                "order_ids": [],
+                "orders": [],
+            }
+        orders = []
+        for order_id in sorted(self.orders):
+            order = self.orders[order_id]
+            orders.append({
+                "id": int(order.get("id", order_id)),
+                "order_type": str(order.get("order_type", "")),
+                "symbol": str(order.get("symbol", "")),
+                "price": float(order.get("price", 0.0) or 0.0),
+                "amount": int(order.get("amount", 0) or 0),
+                "status": str(order.get("status", "")),
+            })
+        return {
+            "authenticated": True,
+            "order_ids": [order["id"] for order in orders],
+            "orders": orders,
+        }
+
+    def get_watchlist(self) -> Dict[str, Any]:
+        """Return the authenticated user's watchlist."""
+        if not self.authenticated:
+            return {
+                "authenticated": False,
+                "count": 0,
+                "watchlist": [],
+            }
+        watchlist = list(self.watch_list)
+        return {
+            "authenticated": True,
+            "count": len(watchlist),
+            "watchlist": watchlist,
+        }
+
+    def trading_get_login_status(self) -> Dict[str, Any]:
+        """Return the current trading authentication state."""
+        return {
+            "logged_in": self.authenticated,
+            "username": self.current_user if self.authenticated else "",
+        }
+
+    def trading_logout(self) -> Dict[str, Any]:
+        """Log out of the trading system."""
+        previous_user = self.current_user
+        was_authenticated = self.authenticated
+        self.authenticated = False
+        self.current_user = ""
+        return {
+            "success": was_authenticated,
+            "username": previous_user if was_authenticated else "",
+        }
+
     def make_transaction(self, account_id: int, xact_type: str, amount: float) -> Dict[str, Any]:
         """Make a deposit or withdrawal based on specified amount."""
         if not self.authenticated:
@@ -245,15 +355,18 @@ class TradingBot:
         """Place an order."""
         if not self.authenticated:
             return {"order_id": 0, "order_type": order_type, "status": "User not authenticated", "price": price, "amount": amount}
+        while (self.order_counter + 1) in self.orders or str(self.order_counter + 1) in self.orders:
+            self.order_counter += 1
         self.order_counter += 1
         order_id = self.order_counter
+        order_status = "Filled"
         self.orders[order_id] = {
             "id": order_id,
             "order_type": order_type,
             "symbol": symbol,
             "price": price,
             "amount": amount,
-            "status": "Open"
+            "status": order_status
         }
         total_cost = price * amount
         self.transaction_history.append({
@@ -263,13 +376,15 @@ class TradingBot:
             "price": price,
             "num_shares": amount,
             "total_cost": total_cost,
-            "status": "Filled",
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "status": order_status,
+            # Use the simulator-owned clock.  Wall-clock timestamps make a
+            # saved trajectory impossible to replay byte-for-byte.
+            "timestamp": self.current_time
         })
         return {
             "order_id": order_id,
             "order_type": order_type,
-            "status": "Open",
+            "status": order_status,
             "price": price,
             "amount": amount
         }
@@ -308,6 +423,9 @@ class TradingBot:
                 self.market_status = "Open"
             else:
                 self.market_status = "Closed"
+            # Store a canonical replayable timestamp using an arbitrary fixed
+            # date; the tool contract exposes time-of-day, not wall-clock time.
+            self.current_time = f"2024-11-05 {hour:02d}:{minute:02d}:00"
         except (ValueError, IndexError):
             self.market_status = "Closed"
             

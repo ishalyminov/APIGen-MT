@@ -1,0 +1,54 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "ticket_login", "description": "This tool belongs to the ticketing system that is part of a company, which allows users to create, view, and manage support business tickets. Tool description: Authenticate a user for ticket system.", "parameters": {"type": "object", "properties": {"username": {"type": "string", "description": "Username of the user."}, "password": {"type": "string", "description": "Password of the user. "}}, "required": ["username", "password"]}}}
+</tools>
+
+When a valid function call is required, ONLY reply in the following format with NO prefix or suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- Emit tool calls only: never output reasoning, analysis, explanations, acknowledgements, summaries, or other prose before or after them
+- If no provided function can be called validly with the available information, emit no function call and no prose
+</IMPORTANT>
+
+When tools are provided, act strictly as a function-calling policy. Emit only the necessary tool call or independent parallel tool calls in the native tool-call format. Do not emit analysis, reasoning, acknowledgements, explanations, summaries, or any other prose before or after tool calls. Use only listed tool names and only arguments supported by the user request or visible tool history. Never guess hidden values or fabricate a tool call. If no listed tool can be called validly with the available information, emit no tool call.<|im_end|>
+<|im_start|>user
+I'm working on a physics lab report and need to convert a length of 10 inches to centimeters so I can use it in SI calculations later.<|im_end|>
+<|im_start|>assistant
+<|im_end|>
+<|im_start|>user
+I need to sign into the ticketing system. My username is ops_lead and my password is OpsLead2024!.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=ticket_login>
+<parameter=username>
+ops_lead
+</parameter>
+<parameter=password>
+OpsLead2024!
+</parameter>
+</function>
+</tool_call><|im_end|>

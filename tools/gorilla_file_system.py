@@ -176,11 +176,9 @@ class GorillaFileSystem:
         except Exception as e:
             return {"error": str(e)}
 
-    def du(self, path: str = ".", human_readable: bool = False) -> Dict[str, Any]:
-        """Calculate disk usage."""
-        target_path = self._get_relative_path(path)
-        if not target_path.exists():
-            return {"error": f"Path '{path}' not found"}
+    def du(self, human_readable: bool = False) -> Dict[str, Any]:
+        """Calculate disk usage of the current working directory."""
+        target_path = Path(self.current_dir)
         
         if target_path.is_file():
             total = target_path.stat().st_size
@@ -225,7 +223,14 @@ class GorillaFileSystem:
         pattern = name if name and name != "None" else ""
         
         for p in search_root.rglob("*"):
-            if pattern and not fnmatch.fnmatch(p.name, pattern):
+            # The public BFCL contract says ``name`` may be contained in the
+            # file name. Preserve glob support while honoring that documented
+            # substring behavior as well.
+            if (
+                pattern
+                and not fnmatch.fnmatch(p.name, pattern)
+                and pattern not in p.name
+            ):
                 continue
             rel = p.relative_to(search_root)
             matches.append(str(rel))
@@ -315,7 +320,12 @@ class GorillaFileSystem:
 
     def pwd(self) -> Dict[str, Any]:
         """Return current working directory."""
-        return {"path": self.current_dir}
+        try:
+            relative = Path(self.current_dir).relative_to(Path(self._temp_dir))
+            virtual_path = "/" if str(relative) == "." else f"/{relative.as_posix()}"
+        except ValueError:
+            virtual_path = "/"
+        return {"path": virtual_path, "current_directory": virtual_path}
 
     def rm(self, file_name: str) -> Dict[str, Any]:
         """Remove file or directory."""
@@ -413,9 +423,13 @@ class GorillaFileSystem:
                 prefix = "SAME"
             diff_lines.append(f"{prefix} {i+1}: {l1} | {l2}")
         
-        return {"diff": diff_lines, "identical": len(diff_lines) == 0}
+        # ``diff_lines`` intentionally contains both SAME and CHG rows for a
+        # readable side-by-side report, so its length cannot indicate equality.
+        # The old check reported every non-empty identical pair as different
+        # and caused grounded trajectory responses to contradict the simulator.
+        return {"diff": diff_lines, "identical": lines1 == lines2}
 
-    def sort(self, file_name: str, reverse: bool = False) -> Dict[str, Any]:
+    def sort(self, file_name: str) -> Dict[str, Any]:
         """Sort and return file contents."""
         path = self._get_relative_path(file_name)
         
@@ -425,7 +439,7 @@ class GorillaFileSystem:
             return {"error": f"'{file_name}' is a directory"}
         
         lines = path.read_text().splitlines()
-        sorted_lines = sorted(lines, reverse=reverse)
+        sorted_lines = sorted(lines)
         return {"lines": sorted_lines, "count": len(sorted_lines)}
 
     def get_state(self) -> Dict[str, Any]:
@@ -449,6 +463,38 @@ class GorillaFileSystem:
             "root": dict_from_path(Path(self._temp_dir)),
             "current_dir": self.current_dir
         }
+
+    def restore_state(self, state: Dict[str, Any]) -> None:
+        """Restore both the serialized mirror and the on-disk workspace.
+
+        ToolManager transaction rollbacks previously reassigned ``_fs_state``
+        while leaving files created by a dry-run on disk.  The next execution
+        then saw those directories as already existing and falsely failed.
+        """
+        root = Path(self._temp_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        for child in list(root.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+
+        saved_tree = state.get("_fs_state", {})
+        self._fs_state = {}
+        if isinstance(saved_tree, dict):
+            self._build_from_dict(saved_tree, root)
+
+        saved_temp_dir = Path(str(state.get("_temp_dir", self._temp_dir)))
+        saved_current = Path(str(state.get("current_dir", self._temp_dir)))
+        try:
+            relative_current = saved_current.relative_to(saved_temp_dir)
+        except ValueError:
+            relative_current = Path(".")
+        restored_current = root / relative_current
+        self.current_dir = str(
+            restored_current if restored_current.is_dir() else root
+        )
+        self._rebuild_fs_state()
 
     def cleanup(self):
         """Remove temp directory."""

@@ -22,18 +22,35 @@ class TokenUsage:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+        self.reasoning_tokens = 0
+        self.cached_prompt_tokens = 0
+        self.cost_usd = 0.0
 
-    def add(self, prompt: int = 0, completion: int = 0, total: int = 0):
+    def add(
+        self,
+        prompt: int = 0,
+        completion: int = 0,
+        total: int = 0,
+        reasoning: int = 0,
+        cached_prompt: int = 0,
+        cost_usd: float = 0.0,
+    ):
         """Add token counts from a single LLM call."""
         self.prompt_tokens += prompt
         self.completion_tokens += completion
         self.total_tokens += total
+        self.reasoning_tokens += reasoning
+        self.cached_prompt_tokens += cached_prompt
+        self.cost_usd += cost_usd
 
     def to_dict(self) -> dict:
         return {
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
-            "total_tokens": self.total_tokens
+            "total_tokens": self.total_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cached_prompt_tokens": self.cached_prompt_tokens,
+            "cost_usd": self.cost_usd,
         }
 
 
@@ -362,7 +379,16 @@ class LocalOpenAILLMClient(LLMClient):
 
         # Token usage tracking
         self.total_calls = 0
+        # Count every HTTP request, including rate limits, server errors, and
+        # timeouts.  ``total_calls`` remains the number of completed responses.
+        # Generation circuit breakers use this stricter counter so transport
+        # retries cannot silently bypass a per-candidate request budget.
+        self.total_attempts = 0
         self.token_usage = TokenUsage()
+        self.last_provider = None
+        self.last_finish_reason = None
+        self.provider_counts: Dict[str, int] = {}
+        self._last_request_finished_at = None
         
         # Initialize local token counter (no model download required)
         self.token_counter = TokenCounter()
@@ -383,20 +409,32 @@ class LocalOpenAILLMClient(LLMClient):
         """Get accumulated token usage statistics."""
         return {
             "total_calls": self.total_calls,
+            "total_attempts": self.total_attempts,
+            "provider_counts": dict(self.provider_counts),
             **self.token_usage.to_dict()
         }
 
     def reset_token_usage(self):
         """Reset token usage counters."""
         self.total_calls = 0
+        self.total_attempts = 0
         self.token_usage = TokenUsage()
+        self.last_provider = None
+        self.last_finish_reason = None
+        self.provider_counts = {}
+        self._last_request_finished_at = None
 
     def chat(self, messages, kwargs) -> tuple[str, str]:
+        # Never attribute a failed request to the provider that happened to
+        # serve the previous successful request.
+        self.last_provider = None
+        self.last_finish_reason = None
         # Count tokens in the prompt before sending to API
         prompt_tokens = self.token_counter.count_prompt_tokens(messages)
 
         if messages[-1]["role"] == "assistant" and self.tokenizer is not None:
             # Fall back to base class prefill logic using tokenizer and /completions
+            self.total_attempts += 1
             response = super().chat(messages, kwargs)
             # Count completion tokens
             completion_tokens = self.token_counter.count_completion_tokens(response[0] if isinstance(response, tuple) else response)
@@ -408,9 +446,20 @@ class LocalOpenAILLMClient(LLMClient):
             self.total_calls += 1
             return response, ""
 
-        max_retries = kwargs.get("max_retries", 3)
+        max_retries = max(
+            1,
+            int(
+                kwargs.get(
+                    "max_retries",
+                    os.getenv("APIGEN_HTTP_ATTEMPTS", "3"),
+                )
+            ),
+        )
         base_delay = 2
-        request_timeout = kwargs.get("timeout", 900)
+        request_timeout = kwargs.get(
+            "timeout",
+            float(os.getenv("APIGEN_LLM_TIMEOUT", "900")),
+        )
         rate_limit_retry_count = 0
         server_error_retry_count = 0
         attempt = 0
@@ -427,6 +476,21 @@ class LocalOpenAILLMClient(LLMClient):
 
         while attempt < max_retries:
             try:
+                minimum_gap = max(
+                    0.0,
+                    float(
+                        os.getenv(
+                            "APIGEN_MIN_SECONDS_BETWEEN_LLM_REQUESTS", "0"
+                        )
+                    ),
+                )
+                if self._last_request_finished_at is not None and minimum_gap:
+                    remaining_gap = minimum_gap - (
+                        time.monotonic() - self._last_request_finished_at
+                    )
+                    if remaining_gap > 0:
+                        time.sleep(remaining_gap)
+                self.total_attempts += 1
                 response = requests.request(
                     "POST",
                     url=f"{self.url}/chat/completions",
@@ -434,13 +498,40 @@ class LocalOpenAILLMClient(LLMClient):
                     json=payload,
                     timeout=request_timeout,
                 )
+                self._last_request_finished_at = time.monotonic()
                 response_obj = response.json()
 
                 if "choices" not in response_obj:
                     # Rate limiting (429) — retry with exponential backoff + jitter, then constant at 60s
                     if response.status_code == 429:
                         rate_limit_retry_count += 1
+                        attempt += 1
+                        error_payload = response_obj.get("error", {})
+                        if isinstance(error_payload, dict):
+                            error_message = str(
+                                error_payload.get("message", "")
+                            ).strip()
+                        else:
+                            error_message = str(error_payload).strip()
+                        if attempt >= max_retries:
+                            raise RuntimeError(
+                                "Rate limit persisted after "
+                                f"{max_retries} HTTP attempts"
+                                + (
+                                    f": {error_message[:300]}"
+                                    if error_message
+                                    else ""
+                                )
+                            )
                         delay = min(base_delay * (2 ** min(rate_limit_retry_count, 6)), 60)
+                        retry_after = getattr(
+                            response, "headers", {}
+                        ).get("Retry-After")
+                        if retry_after:
+                            try:
+                                delay = max(delay, min(float(retry_after), 60))
+                            except ValueError:
+                                pass
                         jitter = _rng.uniform(0, 1.0) * min(delay, 5)
                         delay += jitter
                         print(f"[LLMClient] Rate limited (429), retrying in {delay:.1f}s... (rate limit retry #{rate_limit_retry_count})")
@@ -449,8 +540,12 @@ class LocalOpenAILLMClient(LLMClient):
                     # Server errors (5xx) — retry with backoff
                     if response.status_code >= 500:
                         server_error_retry_count += 1
-                        if server_error_retry_count > 10:
-                            raise RuntimeError(f"Server error persisted after {server_error_retry_count} retries")
+                        attempt += 1
+                        if attempt >= max_retries:
+                            raise RuntimeError(
+                                f"Server error {response.status_code} persisted "
+                                f"after {max_retries} HTTP attempts"
+                            )
                         delay = min(base_delay * (2 ** min(server_error_retry_count, 6)), 60)
                         jitter = _rng.uniform(0, 1.0) * min(delay, 3)
                         delay += jitter
@@ -459,9 +554,21 @@ class LocalOpenAILLMClient(LLMClient):
                         continue
                     raise RuntimeError(f"Unexpected response from API: {response_obj}")
 
-                response_text = response_obj["choices"][0]["message"].get("content") or ""
+                provider = response_obj.get("provider")
+                self.last_provider = str(provider) if provider else None
+                if self.last_provider:
+                    self.provider_counts[self.last_provider] = (
+                        self.provider_counts.get(self.last_provider, 0) + 1
+                    )
+
+                choice = response_obj["choices"][0]
+                finish_reason = choice.get("finish_reason")
+                self.last_finish_reason = (
+                    str(finish_reason) if finish_reason is not None else None
+                )
+                response_text = choice["message"].get("content") or ""
                 if not response_text:
-                    response_text = response_obj["choices"][0]["message"].get("reasoning_content") or ""
+                    response_text = choice["message"].get("reasoning_content") or ""
 
                 # Retry empty responses — reasoning models occasionally return blank content
                 if not response_text.strip():
@@ -489,7 +596,11 @@ class LocalOpenAILLMClient(LLMClient):
                 else:
                     print(f"[LLMClient] Request failed after {attempt + 1} attempts due to timeout")
                     raise
-            except (requests.exceptions.ConnectionError, requests.exceptions.HTTPError) as e:
+            except (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.HTTPError,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** min(attempt, 8))
                     jitter = _rng.uniform(0, 1.0) * min(delay, 3)
@@ -512,14 +623,45 @@ class LocalOpenAILLMClient(LLMClient):
                 else:
                     raise
 
-        # Count completion tokens using local tokenizer
-        completion_tokens = self.token_counter.count_completion_tokens(response_text)
-        total_tokens = prompt_tokens + completion_tokens
+        # Prefer provider-native usage.  Reasoning APIs such as OpenRouter may
+        # return a short visible JSON response while billing thousands of
+        # hidden/returned reasoning tokens.  The old local-only counter silently
+        # missed those tokens and materially understated experiment cost.
+        usage = response_obj.get("usage")
+        if isinstance(usage, dict) and usage.get("prompt_tokens") is not None:
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+            total_tokens = int(
+                usage.get("total_tokens")
+                or (prompt_tokens + completion_tokens)
+            )
+            completion_details = usage.get("completion_tokens_details") or {}
+            prompt_details = usage.get("prompt_tokens_details") or {}
+            reasoning_tokens = int(
+                completion_details.get("reasoning_tokens")
+                or usage.get("reasoning_tokens")
+                or 0
+            )
+            cached_prompt_tokens = int(
+                prompt_details.get("cached_tokens") or 0
+            )
+            cost_usd = float(usage.get("cost") or 0.0)
+        else:
+            completion_tokens = self.token_counter.count_completion_tokens(
+                response_text
+            )
+            total_tokens = prompt_tokens + completion_tokens
+            reasoning_tokens = 0
+            cached_prompt_tokens = 0
+            cost_usd = 0.0
 
         self.token_usage.add(
             prompt=prompt_tokens,
             completion=completion_tokens,
-            total=total_tokens
+            total=total_tokens,
+            reasoning=reasoning_tokens,
+            cached_prompt=cached_prompt_tokens,
+            cost_usd=cost_usd,
         )
         self.total_calls += 1
 

@@ -45,61 +45,73 @@ class MathAPI:
             return {"result": 0.0}
 
     def imperial_si_conversion(self, value: float, unit_in: str, unit_out: str) -> Dict[str, Any]:
-        """
-        Convert a value between imperial and SI units.
-        """
+        """Convert linear, area, or volume values between imperial and SI units."""
         try:
-            unit_in = unit_in.lower().strip()
-            unit_out = unit_out.lower().strip()
-            imperial_aliases = {"f": "fahrenheit", "c": "celsius"}
-            unit_in = imperial_aliases.get(unit_in, unit_in)
-            unit_out = imperial_aliases.get(unit_out, unit_out)
-            plural_to_singular = {
-                "miles": "mile", "kilometers": "km", "km": "km",
-                "pounds": "pound", "kilograms": "kg", "kg": "kg",
-                "inches": "inch", "centimeters": "cm", "cm": "cm",
-                "gallons": "gallon", "liters": "liter", "liter": "liter",
-                "feet": "foot", "meters": "meter", "meter": "meter",
-                "yards": "yard", "ounce": "ounce", "ounces": "ounce",
-                "gram": "gram", "grams": "gram",
-            }
-            unit_in = plural_to_singular.get(unit_in, unit_in)
-            unit_out = plural_to_singular.get(unit_out, unit_out)
-            conversion_factors = {
-                "inch_to_cm": 2.54,
-                "cm_to_inch": 1 / 2.54,
-                "pound_to_kg": 0.453592,
-                "kg_to_pound": 1 / 0.453592,
-                "mile_to_km": 1.60934,
-                "km_to_mile": 1 / 1.60934,
-                "gallon_to_liter": 3.78541,
-                "liter_to_gallon": 1 / 3.78541,
-                "foot_to_meter": 0.3048,
-                "meter_to_foot": 1 / 0.3048,
-                "yard_to_meter": 0.9144,
-                "meter_to_yard": 1 / 0.9144,
-                "ounce_to_gram": 28.3495,
-                "gram_to_ounce": 1 / 28.3495,
-                "fahrenheit_to_celsius": None,
-                "celsius_to_fahrenheit": None,
-            }
+            def normalise_unit(raw: str) -> Tuple[str, int]:
+                unit = str(raw).lower().strip().replace("²", "^2").replace("³", "^3")
+                dimension = 1
+                if unit.startswith("square "):
+                    dimension, unit = 2, unit[len("square "):]
+                elif unit.startswith("cubic "):
+                    dimension, unit = 3, unit[len("cubic "):]
+                elif unit.endswith(" squared"):
+                    dimension, unit = 2, unit[:-len(" squared")]
+                elif unit.endswith(" cubed"):
+                    dimension, unit = 3, unit[:-len(" cubed")]
+                elif unit.endswith("^2"):
+                    dimension, unit = 2, unit[:-2]
+                elif unit.endswith("^3"):
+                    dimension, unit = 3, unit[:-2]
 
-            key = f"{unit_in}_to_{unit_out}"
-            if key in conversion_factors:
-                factor = conversion_factors[key]
-                if factor is not None:
-                    return {"result": float(value * factor)}
-                elif key == "fahrenheit_to_celsius":
-                    return {"result": float((value - 32) * 5 / 9)}
-                elif key == "celsius_to_fahrenheit":
-                    return {"result": float((value * 9 / 5) + 32)}
+                aliases = {
+                    "f": "fahrenheit", "°f": "fahrenheit",
+                    "c": "celsius", "°c": "celsius",
+                    "miles": "mile", "kilometers": "km", "kilometres": "km",
+                    "pounds": "pound", "kilograms": "kg",
+                    "inches": "inch", "centimeters": "cm", "centimetres": "cm",
+                    "gallons": "gallon", "liters": "liter", "litres": "liter",
+                    "feet": "foot", "meters": "meter", "metres": "meter",
+                    "yards": "yard", "ounces": "ounce", "grams": "gram",
+                }
+                return aliases.get(unit.strip(), unit.strip()), dimension
 
-            if unit_in == unit_out:
+            source, source_dimension = normalise_unit(unit_in)
+            target, target_dimension = normalise_unit(unit_out)
+            if source_dimension != target_dimension:
+                return {
+                    "error": "Cannot convert between units with different dimensions."
+                }
+
+            if source == target:
                 return {"result": float(value)}
 
-            return {"result": 0.0}
-        except Exception:
-            return {"result": 0.0}
+            if source_dimension == 1 and {source, target} == {"fahrenheit", "celsius"}:
+                if source == "fahrenheit":
+                    return {"result": float((value - 32) * 5 / 9)}
+                return {"result": float((value * 9 / 5) + 32)}
+
+            linear_factors = {
+                ("inch", "cm"): 2.54,
+                ("pound", "kg"): 0.453592,
+                ("mile", "km"): 1.60934,
+                ("gallon", "liter"): 3.78541,
+                ("foot", "meter"): 0.3048,
+                ("yard", "meter"): 0.9144,
+                ("ounce", "gram"): 28.3495,
+            }
+            factor = linear_factors.get((source, target))
+            if factor is None:
+                inverse = linear_factors.get((target, source))
+                if inverse is not None:
+                    factor = 1 / inverse
+            if factor is None:
+                return {
+                    "error": f"Unsupported conversion: {unit_in} to {unit_out}."
+                }
+
+            return {"result": float(value * (factor ** source_dimension))}
+        except Exception as exc:
+            return {"error": f"Conversion failed: {exc}"}
 
     def logarithm(self, value: float, base: float, precision: int) -> Dict[str, Any]:
         """

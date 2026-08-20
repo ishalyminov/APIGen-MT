@@ -169,7 +169,7 @@ Respond with a JSON object containing 'output_type' and 'output_description'.
 
 ### Output
 
-File: `magnet_tool_extraction/bfcl_v3_tools_with_outputs.jsonl` (105 lines, one JSON object per line)
+File: `magnet_tool_extraction/bfcl_v3_tools_with_outputs.jsonl` (129 lines, one JSON object per line)
 
 ```json
 {
@@ -193,7 +193,7 @@ The two LLM-added fields are `output_type` and `output_description`. Typical out
 
 ### Estimated Runtime
 
-~30 minutes for all 105 tools (dominated by the 5-second sleep between each LLM call).
+~30 minutes for all 129 tools (dominated by the 5-second sleep between each LLM call).
 
 ---
 
@@ -240,7 +240,7 @@ Three input sources are combined:
 
 Before prompting, the script:
 
-1. **Groups tools by class** -- `group_tools_by_class()` groups the 105 tool definitions by `tool_name` field (e.g., all `math_api` tools together)
+1. **Groups tools by class** -- `group_tools_by_class()` groups the 129 tool definitions by `tool_name` field (e.g., all `math_api` tools together)
 2. **Groups invocation examples by function** -- `group_examples_by_function()` for per-method call examples
 3. **Extracts canonical initial configs** -- `get_canonical_initial_configs()` picks the largest (by JSON size) `initial_config` per class from invocation examples
 4. **Selects diverse examples** -- `select_diverse_examples()` picks up to N examples prioritizing different test cases and argument patterns (3 for class generation, 2 for tests)
@@ -860,7 +860,7 @@ Varies significantly with `num_actions` and verification pass rate. For 100 data
 | `magnet_tool_extraction/download_bfcl_v4.py` | BFCL data download helper |
 | `magnet_tool_extraction/tool_definition.py` | ToolDefinition/ToolParameters dataclasses |
 | `magnet_tool_extraction/top_100_frequent_tools.txt` | Frequent tools filter list |
-| `magnet_tool_extraction/bfcl_v3_tools_with_outputs.jsonl` | **Output** (105 tools) |
+| `magnet_tool_extraction/bfcl_v3_tools_with_outputs.jsonl` | **Output** (129 tools) |
 | `magnet_tool_extraction/bfcl_v3_invocation_examples.jsonl` | Invocation examples (3641 entries) |
 
 ### Stage 2: Implementation
