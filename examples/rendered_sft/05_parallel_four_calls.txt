@@ -1,0 +1,68 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "add_contact", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Add a contact to the workspace.", "parameters": {"type": "object", "properties": {"user_name": {"type": "string", "description": "User name of contact to be added."}}, "required": ["user_name"]}}}
+{"type": "function", "function": {"name": "delete_message", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Delete the latest message sent to a receiver.", "parameters": {"type": "object", "properties": {"receiver_id": {"type": "string", "description": "User ID of the user to send the message to."}}, "required": ["receiver_id"]}}}
+{"type": "function", "function": {"name": "get_message_stats", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Get statistics about messages for the current user.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+{"type": "function", "function": {"name": "get_user_id", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Get user ID from user name.", "parameters": {"type": "object", "properties": {"user": {"type": "string", "description": "User name of the user. "}}, "required": ["user"]}}}
+{"type": "function", "function": {"name": "list_users", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: List all users in the workspace.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+{"type": "function", "function": {"name": "message_get_login_status", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Get the login status of the current user.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+{"type": "function", "function": {"name": "message_login", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Log in a user with the given user ID to messeage application.", "parameters": {"type": "object", "properties": {"user_id": {"type": "string", "description": "User ID of the user to log in. "}}, "required": ["user_id"]}}}
+{"type": "function", "function": {"name": "search_messages", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Search for messages containing a specific keyword.", "parameters": {"type": "object", "properties": {"keyword": {"type": "string", "description": "The keyword to search for in messages."}}, "required": ["keyword"]}}}
+{"type": "function", "function": {"name": "send_message", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Send a message to a user.", "parameters": {"type": "object", "properties": {"receiver_id": {"type": "string", "description": "User ID of the user to send the message to."}, "message": {"type": "string", "description": "Message to be sent."}}, "required": ["receiver_id", "message"]}}}
+{"type": "function", "function": {"name": "view_messages_sent", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: View all historical messages sent by the current user.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+</tools>
+
+When a valid function call is required, ONLY reply in the following format with NO prefix or suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- Emit tool calls only: never output reasoning, analysis, explanations, acknowledgements, summaries, or other prose before or after them
+- If no provided function can be called validly with the available information, emit no function call and no prose
+</IMPORTANT>
+
+When tools are provided, act strictly as a function-calling policy. Emit only the necessary tool call or independent parallel tool calls in the native tool-call format. Do not emit analysis, reasoning, acknowledgements, explanations, summaries, or any other prose before or after tool calls. Use only listed tool names and only arguments supported by the user request or visible tool history. Never guess hidden values or fabricate a tool call. If no listed tool can be called validly with the available information, emit no tool call.<|im_end|>
+<|im_start|>user
+I want to see the current message login status, get my message statistics, list all users in this workspace, and look up the user ID for Min-ji Park. Please show me all of these results together.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=message_get_login_status>
+</function>
+</tool_call>
+<tool_call>
+<function=get_message_stats>
+</function>
+</tool_call>
+<tool_call>
+<function=list_users>
+</function>
+</tool_call>
+<tool_call>
+<function=get_user_id>
+<parameter=user>
+Min-ji Park
+</parameter>
+</function>
+</tool_call><|im_end|>

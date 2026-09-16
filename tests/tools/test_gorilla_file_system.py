@@ -75,20 +75,22 @@ def test_diff_identical_files(fs):
     fs.cd(folder="temp")
     fs.cp(source="dev_summary.txt", destination="copy.txt")
     result = fs.diff(file_name1="dev_summary.txt", file_name2="copy.txt")
-    assert result.get("diff_lines", "") == ""
+    assert result["identical"] is True
+    assert all(line.startswith("SAME ") for line in result["diff"])
 
 
 def test_diff_different_files(fs):
     fs.cd(folder="temp")
     fs.echo(content="Different content", file_name="other.txt")
     result = fs.diff(file_name1="dev_summary.txt", file_name2="other.txt")
-    assert result.get("diff_lines", "") != ""
+    assert result["identical"] is False
+    assert any(line.startswith("CHG ") for line in result["diff"])
 
 
 def test_diff_missing_file(fs):
     fs.cd(folder="temp")
     result = fs.diff(file_name1="dev_summary.txt", file_name2="missing.txt")
-    assert "error" in result.get("diff_lines", "").lower() or "not found" in result.get("diff_lines", "").lower()
+    assert "not found" in result["error"].lower()
 
 
 def test_du_human_readable(fs):

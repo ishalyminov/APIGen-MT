@@ -1,0 +1,161 @@
+{
+  "format": "exact-rendered-qwen35-toolonly-sft-samples-v1",
+  "description": "Each .txt is the literal unannotated output of the production SFT render() call before tokenization.",
+  "corpus": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/qwen35_toolonly_sft_sweep_artifacts/data/apigen_toolonly_sft_next_action_targeted200_v1.jsonl",
+  "corpus_sha256": "5bf431f0990c7d89288e111dcf37365d9b600be7914ef6e640834cb5735975cc",
+  "source_manifest": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/qwen35_toolonly_sft_sweep_artifacts/data/apigen_toolonly_sft_next_action_targeted200_v1.manifest.json",
+  "source_rows_loaded": 1391,
+  "load_statistics": {
+    "input": 1391,
+    "dropped_ineligible": 0,
+    "conversation": 911,
+    "trajectory": 480
+  },
+  "model": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/models/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc",
+  "model_file_hashes": {
+    "config.json": "ed1c1723241f23f7f4e23430759cbd7dcfb4103cbdfe052bfe7626b57c2615b4",
+    "tokenizer.json": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+    "tokenizer_config.json": "49e2b6e395f959f077f1e992b338919c0d4a9732fc6e613995e06557f843500c"
+  },
+  "system_prompt": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/APIGen-MT-github/prompts/tool_only_system.txt",
+  "system_prompt_stripped_content_sha256": "6686a4d4431b92d8e77cbff6c31dd5c20f4ebc382c7196d839162a0f4f41b702",
+  "chat_template": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/APIGen-MT-github/templates/qwen35_toolonly_base.jinja",
+  "chat_template_sha256": "0ed8fec54e427e444b0d6a76ed0655753ab6745c1e67199c63d27400959afe49",
+  "tools_catalog": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/APIGen-MT-github/data/tools_openai_format.json",
+  "tools_catalog_sha256": "56e209cb81c17837f55073682621738a0e5ebb7e3de0ae2cd61ba9038767af8f",
+  "render_contract": {
+    "apply_chat_template_tokenize": false,
+    "add_generation_prompt": false,
+    "enable_thinking": false,
+    "tokenizer_add_special_tokens": false,
+    "max_length": 12288,
+    "supervision": "next_action_group_and_terminal_stop",
+    "golden_history": true
+  },
+  "samples": [
+    {
+      "label": "no_tool_stop",
+      "rendered_file": "01_no_tool_stop.txt",
+      "rendered_sha256": "d2a5707146dbe69f65d3c9596328db8a6bce6683af7808f621c3347dbb0ce5b2",
+      "source_row_index_zero_based": 1191,
+      "expanded_example_index_zero_based": 0,
+      "source_line_sha256": "84263a337bef7c8ca13d6e7de6b065cb406e5c30f20a0a57bff362c88d0b122a",
+      "split": "train",
+      "split_seed": 42,
+      "behavior": "no_tool",
+      "visible_tool_count": 1,
+      "target_tool_names": [],
+      "input_token_count": 476,
+      "supervised_token_count": 1,
+      "supervised_token_spans_half_open": [
+        [
+          474,
+          475
+        ]
+      ],
+      "supervised_target_text": "<|im_end|>",
+      "input_ids_sha256": "5096bde32ae75c9aa0b7a0702e85cc867baf88b7f0d0235da8dda5812c3d7cae"
+    },
+    {
+      "label": "recovery_tool_call",
+      "rendered_file": "02_recovery_tool_call.txt",
+      "rendered_sha256": "d17424f71aa91d271e8a5b08f11b8a8456c3d5b08413dcbb095214db2bc35552",
+      "source_row_index_zero_based": 1191,
+      "expanded_example_index_zero_based": 1,
+      "source_line_sha256": "84263a337bef7c8ca13d6e7de6b065cb406e5c30f20a0a57bff362c88d0b122a",
+      "split": "train",
+      "split_seed": 42,
+      "behavior": "single_call",
+      "visible_tool_count": 1,
+      "target_tool_names": [
+        "ticket_login"
+      ],
+      "input_token_count": 555,
+      "supervised_token_count": 44,
+      "supervised_token_spans_half_open": [
+        [
+          510,
+          554
+        ]
+      ],
+      "supervised_target_text": "<tool_call>\n<function=ticket_login>\n<parameter=username>\nops_lead\n</parameter>\n<parameter=password>\nOpsLead2024!\n</parameter>\n</function>\n</tool_call><|im_end|>",
+      "input_ids_sha256": "bd9dea52b3b7485486925ec6c834ff43f94db916c6e55f26cbe5f290924088bd"
+    },
+    {
+      "label": "terminal_stop_after_recovery",
+      "rendered_file": "03_terminal_stop_after_recovery.txt",
+      "rendered_sha256": "37b5dbc07100868c5f7fab162a529dda2450ad527f62f98f4b9e2051d1a83162",
+      "source_row_index_zero_based": 1191,
+      "expanded_example_index_zero_based": 2,
+      "source_line_sha256": "84263a337bef7c8ca13d6e7de6b065cb406e5c30f20a0a57bff362c88d0b122a",
+      "split": "train",
+      "split_seed": 42,
+      "behavior": "no_tool",
+      "visible_tool_count": 1,
+      "target_tool_names": [],
+      "input_token_count": 578,
+      "supervised_token_count": 1,
+      "supervised_token_spans_half_open": [
+        [
+          576,
+          577
+        ]
+      ],
+      "supervised_target_text": "<|im_end|>",
+      "input_ids_sha256": "c97259ac50f2256f89f6bfd3c94ce3bf28b15bc3d0cd07400789aac93b45a129"
+    },
+    {
+      "label": "golden_history_tool_call",
+      "rendered_file": "04_golden_history_tool_call.txt",
+      "rendered_sha256": "636b9b9751d2b9f6ef3855548b5bde516489c9795406c67c44f48cf520243b40",
+      "source_row_index_zero_based": 1269,
+      "expanded_example_index_zero_based": 3,
+      "source_line_sha256": "18cc6742a5c0f58134af2295fa55efaf51880a8f984036c62da1f64ab5f3778f",
+      "split": "train",
+      "split_seed": 42,
+      "behavior": "single_call",
+      "visible_tool_count": 4,
+      "target_tool_names": [
+        "view_messages_sent"
+      ],
+      "input_token_count": 857,
+      "supervised_token_count": 15,
+      "supervised_token_spans_half_open": [
+        [
+          841,
+          856
+        ]
+      ],
+      "supervised_target_text": "<tool_call>\n<function=view_messages_sent>\n</function>\n</tool_call><|im_end|>",
+      "input_ids_sha256": "1269505aba289daac37b6679588bbcb3135a7b2c04b892437a763e5206a7d250"
+    },
+    {
+      "label": "parallel_four_calls",
+      "rendered_file": "05_parallel_four_calls.txt",
+      "rendered_sha256": "081032522c2c5cdbc62c742f9da3d3f676830847bdf8c9c55a8f750856c3b7dc",
+      "source_row_index_zero_based": 854,
+      "expanded_example_index_zero_based": 0,
+      "source_line_sha256": "eb46e448d1cf2199954937a0ee02e2fc01dea448048d64a3839b00551a701ae6",
+      "split": "train",
+      "split_seed": 42,
+      "behavior": "parallel",
+      "visible_tool_count": 10,
+      "target_tool_names": [
+        "message_get_login_status",
+        "get_message_stats",
+        "list_users",
+        "get_user_id"
+      ],
+      "input_token_count": 1316,
+      "supervised_token_count": 74,
+      "supervised_token_spans_half_open": [
+        [
+          1241,
+          1315
+        ]
+      ],
+      "supervised_target_text": "<tool_call>\n<function=message_get_login_status>\n</function>\n</tool_call>\n<tool_call>\n<function=get_message_stats>\n</function>\n</tool_call>\n<tool_call>\n<function=list_users>\n</function>\n</tool_call>\n<tool_call>\n<function=get_user_id>\n<parameter=user>\nMin-ji Park\n</parameter>\n</function>\n</tool_call><|im_end|>",
+      "input_ids_sha256": "df7f3a6e6c02b32ffdbfd42ce459f6611bd2789441c6c40ea9840a45cbdd1c7f"
+    }
+  ]
+}

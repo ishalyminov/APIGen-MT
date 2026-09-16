@@ -16,12 +16,24 @@ class PostingAPI:
         config = initial_config.get('TwitterAPI', initial_config)
         
         self.authenticated: bool = config.get('authenticated', False)
-        self.tweet_counter: int = config.get('tweet_counter', 0)
-        self.tweets: Dict[str, dict] = config.get('tweets', {})
-        self.comments: Dict[int, List[dict]] = config.get('comments', {})
-        self.retweets: List[dict] = config.get('retweets', [])
-        self.following_list: List[str] = config.get('following_list', [])
-        self.users: Dict[str, dict] = config.get('users', {})
+        self.tweets: Dict[str, dict] = copy.deepcopy(config.get('tweets', {}))
+        self.comments: Dict[int, List[dict]] = copy.deepcopy(config.get('comments', {}))
+        self.retweets: List[dict] = copy.deepcopy(config.get('retweets', []))
+        self.following_list: List[str] = list(config.get('following_list', []))
+        self.users: Dict[str, dict] = copy.deepcopy(config.get('users', {}))
+
+        configured_counter = int(config.get('tweet_counter', 0) or 0)
+        existing_ids = []
+        for key, tweet in self.tweets.items():
+            for candidate in (key, tweet.get('id') if isinstance(tweet, dict) else None):
+                try:
+                    existing_ids.append(int(candidate))
+                except (TypeError, ValueError):
+                    pass
+        self.tweet_counter = max(
+            configured_counter,
+            max(existing_ids, default=-1) + 1,
+        )
         self.username: str = config.get('username', '')
         self.password: str = config.get('password', '')
 
@@ -215,6 +227,10 @@ class PostingAPI:
                 mention = f"@{mention}"
             processed_mentions.append(mention)
         
+        # Counters in synthetic seed configs are occasionally stale. Never
+        # overwrite an existing tweet when creating a new one.
+        while str(self.tweet_counter) in self.tweets:
+            self.tweet_counter += 1
         tweet_id = self.tweet_counter
         self.tweet_counter += 1
         
@@ -302,3 +318,25 @@ class PostingAPI:
         
         self.following_list.remove(username_to_unfollow)
         return {"unfollow_status": True}
+
+    def list_all_following(self) -> dict:
+        """List users followed by the authenticated account."""
+        if not self.authenticated:
+            return {
+                "authenticated": False,
+                "following_count": 0,
+                "following": [],
+            }
+        following = sorted(set(self.following_list), key=str.casefold)
+        return {
+            "authenticated": True,
+            "following_count": len(following),
+            "following": following,
+        }
+
+    def posting_get_login_status(self) -> dict:
+        """Return the current Posting API authentication state."""
+        return {
+            "logged_in": self.authenticated,
+            "username": self.username if self.authenticated else "",
+        }

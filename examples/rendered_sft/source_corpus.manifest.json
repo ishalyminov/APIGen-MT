@@ -1,0 +1,114 @@
+{
+  "version": "next_action_combined_targeted200_v1",
+  "created_at": "2026-08-17T00:00:00+00:00",
+  "inputs": [
+    {
+      "path": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/qwen35_toolonly_sft_sweep_artifacts/data/apigen_toolonly_sft_next_action_v2.jsonl",
+      "sha256": "9450d684462fbf4d26d82027a690913097ecc8bd2a49a843f12d552aa66f8f77",
+      "role": "base"
+    },
+    {
+      "path": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/APIGen-MT-github/data/generated/bfcl_transfer_targeted_200_20260816_v13/audits/next_action_visibility.jsonl",
+      "sha256": "398d4c3af45c8d349c3198b3084dd542e093dd17a7365faeb34c8d4e0de21e94",
+      "role": "targeted_addon"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/qwen35_toolonly_sft_sweep_artifacts/data/apigen_toolonly_sft_next_action_v2.manifest.json",
+      "sha256": "e024fdf539f6ffd6e8323ce7a2ce6b621737d6b8049384d4fd85da1e7e6310e9",
+      "role": "base_manifest"
+    },
+    {
+      "path": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/APIGen-MT-github/data/generated/bfcl_transfer_targeted_200_20260816_v13/audits/next_action_visibility.manifest.json",
+      "sha256": "33ee0dd3e5991f448b367a76fa64210f2834200f47106beef651aa8dc5aab0d9",
+      "role": "addon_manifest"
+    }
+  ],
+  "output": "/mnt/shared_ru.ml.SZ-5_000264/gambashidze/qwen35_toolonly_sft_sweep_artifacts/data/apigen_toolonly_sft_next_action_targeted200_v1.jsonl",
+  "output_sha256": "5bf431f0990c7d89288e111dcf37365d9b600be7914ef6e640834cb5735975cc",
+  "rows": 1391,
+  "expected_rows": 1391,
+  "unique_semantic_trajectories": 1391,
+  "source_file_modified": false,
+  "duplicates_skipped": 0,
+  "statistics": {
+    "action_targets": 11988,
+    "action_width:1": 11736,
+    "action_width:2": 94,
+    "action_width:3": 85,
+    "action_width:4": 54,
+    "action_width:5": 19,
+    "decision_targets": 15308,
+    "input_rows": 1391,
+    "no_call_targets": 436,
+    "output_rows": 1391,
+    "parallel_targets": 252,
+    "supervised_turns": 3320,
+    "terminal_stop_targets": 3320,
+    "tool_calls": 12490,
+    "unique_tools": 129
+  },
+  "argument_visibility": {
+    "policy_history": "user queries, accepted prior calls and tool outputs, schema declarations, and system date; recorded assistant prose omitted",
+    "source": {
+      "method": "conservative_policy_visible_top_level_arguments_v1",
+      "definition": "Sum of the already-audited immutable source views; initial state and parallel sibling outputs are hidden.",
+      "initial_state_policy_visible": false,
+      "total_arguments": 16706,
+      "hidden_argument_count": 0,
+      "required_argument_count": 15136,
+      "hidden_required_argument_count": 0,
+      "tasks_with_hidden_arguments": 0,
+      "hidden_argument_ratio": 0.0,
+      "hidden_required_argument_ratio": 0.0,
+      "visibility_source_counts": {
+        "mixed_policy_visible_sources": 2,
+        "no_factual_literal": 192,
+        "prior_call_or_tool_output": 3431,
+        "schema_declared": 1318,
+        "visible_text": 11763
+      },
+      "hidden_by_tool": {}
+    },
+    "output": {
+      "method": "conservative_policy_visible_top_level_arguments_v1",
+      "definition": "Sum of the already-audited immutable source views; initial state and parallel sibling outputs are hidden.",
+      "initial_state_policy_visible": false,
+      "total_arguments": 16706,
+      "hidden_argument_count": 0,
+      "required_argument_count": 15136,
+      "hidden_required_argument_count": 0,
+      "tasks_with_hidden_arguments": 0,
+      "hidden_argument_ratio": 0.0,
+      "hidden_required_argument_ratio": 0.0,
+      "visibility_source_counts": {
+        "mixed_policy_visible_sources": 2,
+        "no_factual_literal": 192,
+        "prior_call_or_tool_output": 3431,
+        "schema_declared": 1318,
+        "visible_text": 11763
+      },
+      "hidden_by_tool": {}
+    }
+  },
+  "training_contract": {
+    "tool_schema_projection": "openai_name_description_parameters_v3",
+    "system_prompt_content_sha256": "6686a4d4431b92d8e77cbff6c31dd5c20f4ebc382c7196d839162a0f4f41b702",
+    "chat_template_sha256": "0ed8fec54e427e444b0d6a76ed0655753ab6745c1e67199c63d27400959afe49",
+    "enable_thinking": false,
+    "supervision": "next_action_group_and_terminal_stop",
+    "prefix_unit": "one_per_next_action_or_parallel_group_with_golden_history",
+    "golden_history": true,
+    "parallel_group_is_one_target": true,
+    "terminal_stop_is_separate_target": true,
+    "split_unit": "source_trajectory_before_prefix_expansion",
+    "hidden_argument_policy": "truncate_before_first_affected_turn",
+    "train_repeat_factors": {
+      "no_tool": 1,
+      "single_call": 1,
+      "parallel": 1,
+      "other": 1
+    }
+  }
+}

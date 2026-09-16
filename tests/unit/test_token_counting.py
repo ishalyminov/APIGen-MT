@@ -238,7 +238,37 @@ class TestTokenUsageTracking:
         assert result == {
             "prompt_tokens": 100,
             "completion_tokens": 50,
-            "total_tokens": 150
+            "total_tokens": 150,
+            "reasoning_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "cost_usd": 0.0,
+        }
+
+    def test_extended_provider_usage_accumulates(self):
+        usage = TokenUsage()
+        usage.add(
+            prompt=100,
+            completion=50,
+            total=150,
+            reasoning=30,
+            cached_prompt=20,
+            cost_usd=0.0015,
+        )
+        usage.add(
+            prompt=10,
+            completion=5,
+            total=15,
+            reasoning=2,
+            cached_prompt=4,
+            cost_usd=0.0002,
+        )
+        assert usage.to_dict() == {
+            "prompt_tokens": 110,
+            "completion_tokens": 55,
+            "total_tokens": 165,
+            "reasoning_tokens": 32,
+            "cached_prompt_tokens": 24,
+            "cost_usd": pytest.approx(0.0017),
         }
 
 
@@ -259,6 +289,7 @@ class TestLocalOpenAILLMClientTokenTracking:
         assert usage["completion_tokens"] == 0
         assert usage["total_tokens"] == 0
         assert usage["total_calls"] == 0
+        assert usage["total_attempts"] == 0
 
     def test_client_reset_token_usage(self):
         """Test resetting token usage."""
@@ -266,6 +297,7 @@ class TestLocalOpenAILLMClientTokenTracking:
         # Simulate some usage
         client.token_usage.add(prompt=100, completion=50, total=150)
         client.total_calls = 5
+        client.total_attempts = 7
         
         client.reset_token_usage()
         usage = client.get_token_usage()
@@ -273,6 +305,86 @@ class TestLocalOpenAILLMClientTokenTracking:
         assert usage["completion_tokens"] == 0
         assert usage["total_tokens"] == 0
         assert usage["total_calls"] == 0
+        assert usage["total_attempts"] == 0
+
+    @pytest.mark.parametrize("status_code", [429, 503])
+    def test_transport_retries_are_strictly_bounded(
+        self,
+        monkeypatch,
+        status_code,
+    ):
+        class Response:
+            def __init__(self, status):
+                self.status_code = status
+
+            def json(self):
+                return {"error": "temporary"}
+
+        requests_made = []
+
+        def request(*args, **kwargs):
+            requests_made.append((args, kwargs))
+            return Response(status_code)
+
+        monkeypatch.setattr("llm_client.requests.request", request)
+        monkeypatch.setattr("llm_client.time.sleep", lambda _delay: None)
+        client = LocalOpenAILLMClient()
+
+        with pytest.raises(RuntimeError, match="after 2 HTTP attempts"):
+            client.generate(
+                [{"role": "user", "content": "test"}],
+                max_retries=2,
+            )
+
+        usage = client.get_token_usage()
+        assert len(requests_made) == 2
+        assert usage["total_attempts"] == 2
+        assert usage["total_calls"] == 0
+
+    def test_transport_retry_then_success_is_fully_accounted(
+        self,
+        monkeypatch,
+    ):
+        class Response:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        responses = iter(
+            [
+                Response(429, {"error": "temporary"}),
+                Response(
+                    200,
+                    {
+                        "choices": [{"message": {"content": "ok"}}],
+                        "usage": {
+                            "prompt_tokens": 2,
+                            "completion_tokens": 1,
+                            "total_tokens": 3,
+                        },
+                    },
+                ),
+            ]
+        )
+        monkeypatch.setattr(
+            "llm_client.requests.request",
+            lambda *args, **kwargs: next(responses),
+        )
+        monkeypatch.setattr("llm_client.time.sleep", lambda _delay: None)
+        client = LocalOpenAILLMClient()
+
+        assert client.generate(
+            [{"role": "user", "content": "test"}],
+            max_retries=2,
+        ) == "ok"
+
+        usage = client.get_token_usage()
+        assert usage["total_attempts"] == 2
+        assert usage["total_calls"] == 1
+        assert usage["total_tokens"] == 3
 
 
 class TestTokenCounterEdgeCases:

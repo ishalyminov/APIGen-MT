@@ -1,0 +1,83 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "get_user_id", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Get user ID from user name.", "parameters": {"type": "object", "properties": {"user": {"type": "string", "description": "User name of the user. "}}, "required": ["user"]}}}
+{"type": "function", "function": {"name": "message_login", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Log in a user with the given user ID to messeage application.", "parameters": {"type": "object", "properties": {"user_id": {"type": "string", "description": "User ID of the user to log in. "}}, "required": ["user_id"]}}}
+{"type": "function", "function": {"name": "view_messages_sent", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: View all historical messages sent by the current user.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+{"type": "function", "function": {"name": "get_message_stats", "description": "This tool belongs to the Message API, which is used to manage user interactions in a workspace. Tool description: Get statistics about messages for the current user.", "parameters": {"type": "object", "properties": {}, "required": []}}}
+</tools>
+
+When a valid function call is required, ONLY reply in the following format with NO prefix or suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- Emit tool calls only: never output reasoning, analysis, explanations, acknowledgements, summaries, or other prose before or after them
+- If no provided function can be called validly with the available information, emit no function call and no prose
+</IMPORTANT>
+
+When tools are provided, act strictly as a function-calling policy. Emit only the necessary tool call or independent parallel tool calls in the native tool-call format. Do not emit analysis, reasoning, acknowledgements, explanations, summaries, or any other prose before or after tool calls. Use only listed tool names and only arguments supported by the user request or visible tool history. Never guess hidden values or fabricate a tool call. If no listed tool can be called validly with the available information, emit no tool call.<|im_end|>
+<|im_start|>user
+I'm planning a road trip from Austin to Dallas. First, let me check my current fuel level so I know where I stand.<|im_end|>
+<|im_start|>assistant
+<|im_end|>
+<|im_start|>user
+Log me into the messaging app using my name 'Founder', then show me the messages I've sent and the overall messaging statistics.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=get_user_id>
+<parameter=user>
+Founder
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"user_id": "USR401"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=message_login>
+<parameter=user_id>
+USR401
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"login_status": true, "message": "User 'USR401' logged in successfully."}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=view_messages_sent>
+</function>
+</tool_call><|im_end|>

@@ -74,7 +74,7 @@ CLASS_KEY_TO_INITIAL_CONFIG_KEY = {
 
 
 def load_tool_definitions() -> List[Dict[str, Any]]:
-    """Load all 105 tool definitions from bfcl_v3_tools_with_outputs.jsonl."""
+    """Load all 129 stateful BFCL V3 tool definitions from bfcl_v3_tools_with_outputs.jsonl."""
     path = TOOLS_EXTRACTION_DIR / "bfcl_v3_tools_with_outputs.jsonl"
     tools = []
     with open(path) as f:
@@ -543,7 +543,7 @@ STATEFUL_AUTH_INFO: Dict[str, Dict[str, Any]] = {
     },
     "posting_api": {
         "login_method": "authenticate_twitter",
-        "login_params": {"username": "genealogy_enthusiast", "password": "Fh7#mK9$pL2&vN4"},
+        "login_params": {"username": "genealogy_enthusiast", "password": "testpass"},
         "auth_state_field": "authenticated",
         "auth_failure_value": False,
         "gated_methods": ["post_tweet", "comment", "retweet", "follow_user", "unfollow_user", "mention"],
@@ -551,7 +551,7 @@ STATEFUL_AUTH_INFO: Dict[str, Dict[str, Any]] = {
     },
     "trading_bot": {
         "login_method": "trading_login",
-        "login_params": {"username": "trader", "password": "pass123"},
+        "login_params": {"username": "trader", "password": "testpass"},
         "auth_state_field": "authenticated",
         "auth_failure_value": False,
         "gated_methods": [],
@@ -563,7 +563,7 @@ STATEFUL_AUTH_INFO: Dict[str, Dict[str, Any]] = {
     },
     "travel_booking": {
         "login_method": "authenticate_travel",
-        "login_params": {"client_id": "c1", "client_secret": "s1",
+        "login_params": {"client_id": "c1", "client_secret": "test_secret",
                          "refresh_token": "r1", "grant_type": "read_write",
                          "user_first_name": "M", "user_last_name": "S"},
         "auth_state_field": "access_token",
@@ -578,7 +578,7 @@ STATEFUL_AUTH_INFO: Dict[str, Dict[str, Any]] = {
     },
     "ticket_api": {
         "login_method": "ticket_login",
-        "login_params": {"username": "agent_a", "password": "pass123"},
+        "login_params": {"username": "agent_a", "password": "testpass"},
         "auth_state_field": "current_user",
         "auth_failure_value": "",
         "gated_methods": [],
